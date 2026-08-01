@@ -1,0 +1,10 @@
+# gitleaks allowlist — known false positives.
+#
+# cdk-nag-report.txt (now untracked and gitignored) is a generated CDK synth
+# report. gitleaks flagged CDK asset S3 keys — SHA-256 bundle hashes of the
+# form "S3Key: <64-hex>.zip" — as generic-api-key. These are content-address
+# digests, not credentials. The fingerprints below reference the file as it
+# exists in earlier commits (07f06a3), which remain in branch history.
+07f06a37129b6e28f2449976b52bb038c5efcd35:cdk-nag-report.txt:generic-api-key:403
+07f06a37129b6e28f2449976b52bb038c5efcd35:cdk-nag-report.txt:generic-api-key:425
+07f06a37129b6e28f2449976b52bb038c5efcd35:cdk-nag-report.txt:generic-api-key:1178

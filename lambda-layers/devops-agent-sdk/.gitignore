@@ -1,0 +1,3 @@
+# Build outputs — regenerable from service-model/ + build.sh.
+botocore-models/
+layer.zip

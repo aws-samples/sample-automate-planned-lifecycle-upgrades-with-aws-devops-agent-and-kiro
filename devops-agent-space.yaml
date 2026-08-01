@@ -1,0 +1,2546 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS DevOps Agent Space for Amazon EKS upgrade POC
+
+Parameters:
+  NameSuffix:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9-]{1,20}$'
+    Description: >
+      Optional suffix appended to named resources so multiple deployments can
+      coexist in the same account/region. Lowercase alphanumeric and hyphens,
+      1-20 chars. Leave empty for a single default deployment.
+  GitHubRepo:
+    Type: String
+    Description: GitHub repo (owner/name) that hosts the upgrade workflows.
+  ClusterName:
+    Type: String
+    Default: eks-upgrade-poc
+    Description: >
+      EKS cluster name (without the NameSuffix — the suffix is applied
+      automatically to match the CDK stack).
+  DevOpsAgentSdkLayerBucket:
+    Type: String
+    Description: >
+      S3 bucket containing the devops-agent-sdk Lambda layer artifact
+      (layer.zip — bundles a boto3 version that knows about the
+      `devops-agent` service, since the Lambda runtime's bundled boto3
+      doesn't). bootstrap.sh uploads the artifact and passes the bucket
+      and key in.
+  DevOpsAgentSdkLayerKey:
+    Type: String
+    Description: >
+      S3 key for the devops-agent-sdk Lambda layer artifact (e.g.
+      `lambda-layers/devops-agent-sdk/layer-<sha>.zip`). Must match what
+      bootstrap.sh uploaded.
+
+Conditions:
+  HasSuffix: !Not [!Equals [!Ref NameSuffix, '']]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # DevOps Agent space + IAM
+  # ---------------------------------------------------------------------------
+  DevOpsAgentSpaceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >
+              The '*' resource applies only to read-only investigation actions
+              (eks:Describe*/List*, cloudformation:Describe*/Get*/List*,
+              cloudtrail:LookupEvents) which do not support resource-level ARN
+              scoping.
+          - id: W28
+            reason: >
+              Explicit role name is intentional and referenced by the DevOps
+              Agent space configuration; replacement on update is not expected.
+    Properties:
+      RoleName: !If
+        - HasSuffix
+        - !Sub DevOpsAgentRole-AgentSpace-${NameSuffix}
+        - DevOpsAgentRole-AgentSpace
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+      Policies:
+        - PolicyName: AllowCreateServiceLinkedRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer
+        - PolicyName: AllowReadOnlyInvestigationApis
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                  - eks:DescribeUpdate
+                  - eks:ListUpdates
+                  - eks:DescribeAddonVersions
+                  - eks:DescribeCluster
+                  - eks:DescribeAddon
+                  - eks:ListAddons
+                  - eks:DescribeNodegroup
+                  - eks:ListNodegroups
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                Resource: '*'
+
+  DevOpsOperatorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              Explicit role name is intentional and referenced operationally;
+              replacement on update is not expected.
+    Properties:
+      RoleName: !If
+        - HasSuffix
+        - !Sub DevOpsAgentRole-WebappAdmin-${NameSuffix}
+        - DevOpsAgentRole-WebappAdmin
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsOperatorAppAccessPolicy
+
+  AgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    DependsOn:
+      - DevOpsAgentSpaceRole
+      - DevOpsOperatorRole
+    Properties:
+      Name: !If
+        - HasSuffix
+        - !Sub ${ClusterName}-${NameSuffix}
+        - !Ref ClusterName
+      Description: EKS upgrade POC - upgrade planning, failure RCA, and mitigation
+      OperatorApp:
+        Iam:
+          OperatorAppRoleArn: !GetAtt DevOpsOperatorRole.Arn
+
+  MonitorAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Properties:
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      ServiceId: aws
+      Configuration:
+        Aws:
+          AssumableRoleArn: !GetAtt DevOpsAgentSpaceRole.Arn
+          AccountId: !Ref AWS::AccountId
+          AccountType: monitor
+
+  SecretsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer-managed key for DevOps Agent pipeline secrets
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Grants the account root full access to the key. This is the
+          # AWS-recommended default key policy: it delegates access control to
+          # IAM policies (a key with no such statement can become unmanageable).
+          # For production, consider replacing 'kms:*' with only the actions the
+          # workload needs (e.g. kms:Decrypt, kms:Encrypt, kms:GenerateDataKey,
+          # kms:DescribeKey) and scoping the principal to specific roles.
+          - Sid: AllowAccountRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  SecretsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !If
+        - HasSuffix
+        - !Sub 'alias/devops-agent-secrets-${NameSuffix}'
+        - alias/devops-agent-secrets
+      TargetKeyId: !Ref SecretsKmsKey
+
+  # ---------------------------------------------------------------------------
+  # Dead letter queue — shared by all pipeline Lambdas. Captures async
+  # invocation payloads that fail after Lambda's automatic retries so failures
+  # can be inspected rather than silently dropped.
+  # ---------------------------------------------------------------------------
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !If
+        - HasSuffix
+        - !Sub devops-agent-lambda-dlq-${NameSuffix}
+        - devops-agent-lambda-dlq
+      MessageRetentionPeriod: 1209600  # 14 days (maximum)
+      KmsMasterKeyId: !Ref SecretsKmsKey
+      KmsDataKeyReusePeriodSeconds: 300
+
+  # ---------------------------------------------------------------------------
+  # Secrets
+  # ---------------------------------------------------------------------------
+  GitHubTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !If
+        - HasSuffix
+        - !Sub devops-agent/github-pat-${NameSuffix}
+        - devops-agent/github-pat
+      Description: >
+        GitHub PAT for triggering workflow_dispatch on eks-upgrade.yml and
+        next-steps.yml. Needs Actions: read+write, Contents: read+write,
+        Pull requests: read+write on this repo. See README Step 4.
+      SecretString: PLACEHOLDER  # checkov:skip=CKV_SECRET_6 literal placeholder, real PAT set out-of-band post-deploy (README Step 4)
+      KmsKeyId: !GetAtt SecretsKmsKey.Arn
+
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !If
+        - HasSuffix
+        - !Sub devops-agent/webhook-credentials-${NameSuffix}
+        - devops-agent/webhook-credentials
+      Description: >
+        DevOps Agent generic webhook credentials. After deploying this stack,
+        generate a webhook in the DevOps Agent console (Capabilities > Webhook >
+        Generate), then update this secret with JSON:
+        {"url":"<webhook-url>","secret":"<hmac-secret>"}
+      SecretString: '{"url":"PLACEHOLDER","secret":"PLACEHOLDER"}'  # checkov:skip=CKV_SECRET_6 literal placeholders, real credentials set out-of-band post-deploy (see Description)
+      KmsKeyId: !GetAtt SecretsKmsKey.Arn
+
+  # ---------------------------------------------------------------------------
+  # SNS topic — operator notifications when a mitigation plan completes.
+  # The Trigger Lambda extracts the agent's "## Immediate Steps" section and
+  # publishes it here along with a link to the (forthcoming) Agent Spec PR
+  # so on-call sees the urgent actions in their inbox/Slack/PagerDuty before
+  # they read the full spec.
+  # ---------------------------------------------------------------------------
+  MitigationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !If
+        - HasSuffix
+        - !Sub eks-upgrade-failure-mitigation-${NameSuffix}
+        - eks-upgrade-failure-mitigation
+      DisplayName: EKS Upgrade Failure Mitigation
+      KmsMasterKeyId: alias/aws/sns
+
+
+  # ---------------------------------------------------------------------------
+  # EventBridge diagnostic logging
+  # Every rule below targets this log group as a secondary destination so
+  # matched events land here alongside the Lambda invocation. Useful for
+  # diagnosing "did my event match" issues.
+  # ---------------------------------------------------------------------------
+  EventBridgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: >
+              This log group holds only EventBridge event-match diagnostics (no
+              secrets or customer data); default CloudWatch Logs encryption is
+              sufficient for this POC.
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: >
+              Log group holds only EventBridge event-match diagnostics (no
+              secrets or customer data); default CloudWatch Logs encryption is
+              sufficient for this POC.
+    Properties:
+      LogGroupName: !If
+        - HasSuffix
+        - !Sub /aws/events/eks-upgrade-pipeline-${NameSuffix}
+        - /aws/events/eks-upgrade-pipeline
+      RetentionInDays: 14
+
+  EventBridgeLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !If
+        - HasSuffix
+        - !Sub EventBridgeToCWLogs-${NameSuffix}
+        - EventBridgeToCWLogs
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"] },
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "${EventBridgeLogGroup.Arn}"
+          }]
+        }
+
+  # ---------------------------------------------------------------------------
+  # SNS topic — skill update notifications when the daily review finds gaps.
+  # ---------------------------------------------------------------------------
+  SkillUpdateNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !If
+        - HasSuffix
+        - !Sub eks-skill-update-notifications-${NameSuffix}
+        - eks-skill-update-notifications
+      DisplayName: EKS Skill Update Notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  # ---------------------------------------------------------------------------
+  # Skill Review Lambda — daily kickoff that fetches current skills from GitHub
+  # and posts a webhook to trigger an eks-skill-review investigation.
+  # ---------------------------------------------------------------------------
+  SkillReviewLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              Explicit role name is intentional; replacement on update is not
+              expected.
+    Properties:
+      RoleName: !If
+        - HasSuffix
+        - !Sub DevOpsAgent-SkillReviewLambda-${NameSuffix}
+        - DevOpsAgent-SkillReviewLambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref WebhookSecret
+                  - !Ref GitHubTokenSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt SecretsKmsKey.Arn
+        - PolicyName: SendToDeadLetterQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  SkillReviewLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              This function only calls AWS service APIs (Secrets Manager, KMS,
+              GitHub over the public internet); it accesses no VPC resources, so
+              VPC attachment would add NAT cost and cold-start latency with no
+              security benefit.
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Function calls only AWS/GitHub APIs over the public internet; no
+              VPC resources are accessed, so VPC attachment adds cost/latency
+              with no security benefit.
+          - id: CKV_AWS_173
+            comment: >
+              Environment variables hold only resource references (Secrets
+              Manager ARNs, repo/topic/cluster names) — no secret material. The
+              actual secrets live in Secrets Manager, KMS-encrypted.
+    Properties:
+      FunctionName: !If
+        - HasSuffix
+        - !Sub devops-agent-skill-review-trigger-${NameSuffix}
+        - devops-agent-skill-review-trigger
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SkillReviewLambdaRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json, os, hmac, hashlib, base64, http.client, urllib.request, urllib.error, boto3
+          from datetime import datetime, timezone
+
+          # Every skill the daily review examines, including the review skill
+          # itself — its verification guidance and output contract go stale the
+          # same way the operational skills do, and nothing else audits it.
+          SKILL_PATHS = [
+              'skills/eks-upgrade-planning/SKILL.md',
+              'skills/eks-failure-root-cause/SKILL.md',
+              'skills/eks-investigation-triage-rules/SKILL.md',
+              'skills/eks-skill-review/SKILL.md',
+          ]
+
+          def _fetch_file_from_github(token, repo, path, ref='main'):
+              """Fetch a file from GitHub via Contents API (returns decoded text)."""
+              host = 'api.github.com'
+              api_path = f'/repos/{repo}/contents/{path}?ref={ref}'
+              conn = http.client.HTTPSConnection(host, timeout=15)
+              try:
+                  conn.request('GET', api_path, headers={
+                      'Authorization': f'Bearer {token}',
+                      'Accept': 'application/vnd.github.v3.raw',
+                      'User-Agent': 'devops-agent-skill-review/1.0',
+                  })
+                  resp = conn.getresponse()
+                  if resp.status != 200:
+                      body = resp.read().decode(errors='replace')[:500]
+                      print(f"WARNING: GitHub {resp.status} for {path}: {body}")
+                      return None
+                  return resp.read().decode()
+              finally:
+                  conn.close()
+
+          def handler(event, context):
+              sm = boto3.client('secretsmanager')
+
+              # Fetch GitHub PAT to read current skills
+              token = sm.get_secret_value(SecretId=os.environ['GITHUB_TOKEN_SECRET'])['SecretString']  # checkov:skip=CKV_SECRET_6 SDK call, not a hardcoded secret
+              if token == 'PLACEHOLDER':
+                  raise ValueError("GitHub PAT not configured (see README Step 4).")
+
+              # Fetch webhook credentials
+              creds = json.loads(sm.get_secret_value(SecretId=os.environ['WEBHOOK_SECRET'])['SecretString'])  # checkov:skip=CKV_SECRET_6 SDK call, not a hardcoded secret
+              webhook_url = creds['url']
+              webhook_secret = creds['secret']
+              if webhook_url == 'PLACEHOLDER' or webhook_secret == 'PLACEHOLDER':
+                  raise ValueError("Webhook secret not configured (see README Step 3).")
+
+              repo = os.environ['GITHUB_REPO']
+
+              # Fetch current skill content from GitHub
+              skill_content_sections = []
+              for path in SKILL_PATHS:
+                  content = _fetch_file_from_github(token, repo, path)
+                  if content:
+                      skill_content_sections.append(f"### {path}\n\n{content}")
+                  else:
+                      skill_content_sections.append(f"### {path}\n\n(FETCH FAILED — skip this skill)")
+
+              now = datetime.now(timezone.utc)
+              iso_ts = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+              timestamp = now.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+              review_date = now.strftime('%Y-%m-%d')
+
+              description = (
+                  f"Perform daily skill review for EKS upgrade pipeline.\n"
+                  f"Date: {review_date}\n\n"
+                  f"Follow the eks-skill-review skill. Compare the current skill content "
+                  f"below against live AWS APIs and documentation. Produce a Skill Update "
+                  f"Spec with any needed changes, or state CHANGES_FOUND: NO if all skills "
+                  f"are current.\n\n"
+                  f"## Current Skill Content\n\n"
+                  + "\n\n".join(skill_content_sections)
+              )
+
+              incident_id = f"skill-review-{now.strftime('%Y%m%d%H%M%S')}"
+              payload = json.dumps({
+                  'eventType': 'incident',
+                  'incidentId': incident_id,
+                  'action': 'created',
+                  'priority': 'LOW',
+                  'title': f"Daily EKS custom skills review — {review_date}",
+                  'description': description,
+                  'timestamp': timestamp,
+                  'service': 'SkillReview',
+                  'data': {'reviewDate': review_date},
+              })
+
+              sig = base64.b64encode(
+                  hmac.new(webhook_secret.encode(), f"{timestamp}:{payload}".encode(), hashlib.sha256).digest()
+              ).decode()
+
+              print(f"POSTing skill review webhook: incident_id={incident_id}")
+              req = urllib.request.Request(webhook_url, data=payload.encode(), headers={
+                  'Content-Type': 'application/json',
+                  'x-amzn-event-timestamp': timestamp,
+                  'x-amzn-event-signature': sig,
+              }, method='POST')
+              try:
+                  resp = urllib.request.urlopen(req)
+                  print(f"Webhook success: status={resp.status}")
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode(errors='replace')[:1000]
+                  print(f"ERROR: webhook POST {e.code}: {body}")
+                  raise
+              except urllib.error.URLError as e:
+                  print(f"ERROR: webhook network failure: {e.reason}")
+                  raise
+              return {'statusCode': 200, 'incidentId': incident_id}
+      Environment:
+        Variables:
+          WEBHOOK_SECRET: !Ref WebhookSecret
+          GITHUB_TOKEN_SECRET: !Ref GitHubTokenSecret
+          GITHUB_REPO: !Ref GitHubRepo
+
+  SkillReviewLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SkillReviewLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SkillReviewScheduleRule.Arn
+
+  SkillReviewScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !If
+        - HasSuffix
+        - !Sub eks-skill-review-daily-${NameSuffix}
+        - eks-skill-review-daily
+      Description: Daily trigger for EKS skill review (08:00 UTC)
+      ScheduleExpression: 'cron(0 8 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: SkillReviewLambda
+          Arn: !GetAtt SkillReviewLambda.Arn
+
+  # ---------------------------------------------------------------------------
+  # Health Lambda — opens an upgrade-planning investigation on the agent
+  # ---------------------------------------------------------------------------
+  HealthEventLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              Explicit role name is intentional; replacement on update is not
+              expected.
+    Properties:
+      RoleName: !If
+        - HasSuffix
+        - !Sub DevOpsAgent-HealthEventLambda-${NameSuffix}
+        - DevOpsAgent-HealthEventLambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GetWebhookSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt SecretsKmsKey.Arn
+        - PolicyName: SendToDeadLetterQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  HealthEventLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              This function only calls AWS service APIs (Secrets Manager, KMS,
+              DevOps Agent); it accesses no VPC resources, so VPC attachment
+              would add NAT cost and cold-start latency with no security benefit.
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Function calls only AWS service APIs; no VPC resources are
+              accessed, so VPC attachment adds cost/latency with no security
+              benefit.
+          - id: CKV_AWS_173
+            comment: >
+              Environment variables hold only resource references (Secrets
+              Manager ARNs, repo/topic/cluster names) — no secret material. The
+              actual secrets live in Secrets Manager, KMS-encrypted.
+    Properties:
+      FunctionName: !If
+        - HasSuffix
+        - !Sub devops-agent-health-event-${NameSuffix}
+        - devops-agent-health-event
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt HealthEventLambdaRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json, os, hmac, hashlib, base64, urllib.request, urllib.error, boto3
+          from datetime import datetime, timezone
+
+          def handler(event, context):
+              detail = event['detail']
+              service = detail.get('service', 'UNKNOWN')
+              event_code = detail.get('eventTypeCode', '')
+              entities = [e['entityValue'] for e in detail.get('affectedEntities', []) if e.get('status') == 'PENDING']
+              print(f"Health event: service={service} code={event_code} affected={len(entities)}")
+
+              sm = boto3.client('secretsmanager')
+              creds = json.loads(sm.get_secret_value(SecretId=os.environ['WEBHOOK_SECRET'])['SecretString'])  # checkov:skip=CKV_SECRET_6 SDK call, not a hardcoded secret
+              webhook_url = creds['url']
+              webhook_secret = creds['secret']
+              if webhook_url == 'PLACEHOLDER' or webhook_secret == 'PLACEHOLDER':
+                  raise ValueError("Webhook secret not configured. Update the secret in Secrets Manager (see README Step 3).")
+
+              now = datetime.now(timezone.utc)
+              timestamp = now.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+              iso_ts = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+              region = detail.get('eventRegion', 'us-east-1')
+
+              cluster_name = 'unknown'
+              for arn in entities:
+                  if ':cluster/' in arn:
+                      cluster_name = arn.split(':cluster/')[-1]
+                      break
+              if cluster_name == 'unknown':
+                  print(f"WARNING: could not extract cluster name from entities (code={event_code}, entities={entities})")
+
+              title = f"EKS upgrade planning: {cluster_name} ({region}) — {iso_ts}"
+              description = (
+                  f"Investigation details: Plan an upgrade for EKS cluster {cluster_name} in {region}.\n\n"
+                  f"Follow the eks-upgrade-planning skill. You MUST include the CDK Change Spec block "
+                  f"in your summary with exact addon version strings from the AWS API.\n\n"
+                  f"Query describe-addon-versions for each addon to get the latest compatible versions. "
+                  f"Include the full eksbuild version strings in your output. "
+                  f"Investigation starting point: EKS cluster {cluster_name} in {region} "
+                  f"Date and time of incident: {iso_ts}"
+              )
+
+              incident_id = f"health-{event_code}-{now.strftime('%Y%m%d%H%M%S')}"
+              # Open a brand new investigation. No parent linking — this is the
+              # entry point of the upgrade-planning path.
+              payload = json.dumps({
+                  'eventType': 'incident',
+                  'incidentId': incident_id,
+                  'action': 'created',
+                  'priority': 'HIGH',
+                  'title': title,
+                  'description': description,
+                  'timestamp': timestamp,
+                  'service': 'AWSHealth',
+                  'data': detail
+              })
+              sig = base64.b64encode(
+                  hmac.new(webhook_secret.encode(), f"{timestamp}:{payload}".encode(), hashlib.sha256).digest()
+              ).decode()
+
+              print(f"POSTing webhook to DevOps Agent: incident_id={incident_id} cluster={cluster_name}")
+              req = urllib.request.Request(webhook_url, data=payload.encode(), headers={
+                  'Content-Type': 'application/json',
+                  'x-amzn-event-timestamp': timestamp,
+                  'x-amzn-event-signature': sig,
+              }, method='POST')
+              try:
+                  resp = urllib.request.urlopen(req)
+                  print(f"Webhook success: status={resp.status} incident_id={incident_id}")
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode(errors='replace')[:1000]
+                  print(f"ERROR: webhook POST {e.code} for incident_id={incident_id}: {body}")
+                  raise
+              except urllib.error.URLError as e:
+                  print(f"ERROR: webhook network failure for incident_id={incident_id}: {e.reason}")
+                  raise
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          WEBHOOK_SECRET: !Ref WebhookSecret
+
+  HealthEventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HealthEventLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthPlannedLifecycleRule.Arn
+
+  HealthPlannedLifecycleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !If
+        - HasSuffix
+        - !Sub eks-health-planned-lifecycle-${NameSuffix}
+        - eks-health-planned-lifecycle
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+        detail:
+          service:
+            - EKS
+          eventTypeCategory:
+            - scheduledChange
+          eventTypeCode:
+            - AWS_EKS_PLANNED_LIFECYCLE_EVENT
+      Targets:
+        - Id: HealthEventLambda
+          Arn: !GetAtt HealthEventLambda.Arn
+        - Id: EventBridgeLogGroup
+          Arn: !GetAtt EventBridgeLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
+  # Trigger Lambda — fires on Investigation Completed.
+  #
+  # 1. Calls aidevops:ListJournalRecords(agentSpaceId, executionId) via boto3
+  #    (using the `devops-agent-sdk` Lambda layer that ships the botocore
+  #    service model JSON, discovered via AWS_DATA_PATH).
+  #
+  # 2. Stitches the journal records' `content` into a findings string and
+  #    classifies by content markers. Checked top to bottom; first match
+  #    wins. Order matters for loop-safety:
+  #      - "## Mitigation Plan" → a failure investigation completed with
+  #        Root Cause + Immediate Steps + Mitigation Plan all in one agent
+  #        run. Dispatch next-steps.yml (Kiro CLI generates an agent-ready
+  #        recovery spec PR) AND publish "## Immediate Steps" to the SNS
+  #        topic for operator notification. Checked FIRST so a mitigation
+  #        plan can never accidentally route to upgrade — even if it quotes
+  #        CLUSTER_VERSION from upstream context.
+  #      - "### Skill Update Spec" with CHANGES_FOUND: YES → daily skill
+  #        review found updates. Dispatch skill-update.yml + publish to
+  #        skill update SNS topic. CHANGES_FOUND: NO → log and exit.
+  #      - Filled-in CDK Change Spec (CLUSTER_VERSION: <minor>) →
+  #        upgrade-planning investigation; dispatch eks-upgrade.yml.
+  #      - "### Root Cause:" without a Mitigation Plan → the failure
+  #        investigation stalled mid-way. Log a WARNING for human follow-up
+  #        and exit. We DO NOT auto-spawn a follow-up investigation —
+  #        failures must never silently re-launch agent runs.
+  #      - Anything else → log a diagnostic dump and exit.
+  # ---------------------------------------------------------------------------
+  TriggerUpgradeLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              Explicit role name is intentional; replacement on update is not
+              expected.
+    Properties:
+      RoleName: !If
+        - HasSuffix
+        - !Sub DevOpsAgent-TriggerUpgradeLambda-${NameSuffix}
+        - DevOpsAgent-TriggerUpgradeLambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GetGitHubTokenSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GitHubTokenSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt SecretsKmsKey.Arn
+        - PolicyName: PublishMitigationNotifications
+          # SNS publish for operator notification when a mitigation plan
+          # completes — the Lambda extracts "## Immediate Steps" from the
+          # agent's output and publishes it with a link to the Agent Spec PR.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref MitigationNotificationTopic
+                  - !Ref SkillUpdateNotificationTopic
+        - PolicyName: ListJournalRecordsForFindings
+          # The IAM service prefix is `aidevops` (per the AWS Service
+          # Authorization Reference for "AWS DevOps Agent Service") even
+          # though the API hostname uses `devops-agent`. They differ.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aidevops:ListJournalRecords
+                  - aidevops:ListExecutions
+                  - aidevops:UpdateBacklogTask
+                  - aidevops:GetBacklogTask
+                Resource:
+                  - !GetAtt AgentSpace.Arn
+        - PolicyName: ScheduleMitigationCheck
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:DeleteSchedule
+                Resource:
+                  - !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/mitigation-check-*'
+                  - !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/dispatch-lock-*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt TriggerSchedulerRole.Arn
+        - PolicyName: SendToDeadLetterQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  TriggerSchedulerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              Explicit role name is intentional; replacement on update is not
+              expected.
+    Properties:
+      RoleName: !If
+        - HasSuffix
+        - !Sub DevOpsAgent-TriggerScheduler-${NameSuffix}
+        - DevOpsAgent-TriggerScheduler
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeTriggerLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !If
+                  - HasSuffix
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:devops-agent-trigger-upgrade-${NameSuffix}'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:devops-agent-trigger-upgrade'
+
+  DevOpsAgentSdkLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !If
+        - HasSuffix
+        - !Sub devops-agent-sdk-${NameSuffix}
+        - devops-agent-sdk
+      Description: Botocore service model for the devops-agent API (~26 KB). Discovered via AWS_DATA_PATH=/opt/botocore-models.
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !Ref DevOpsAgentSdkLayerBucket
+        S3Key: !Ref DevOpsAgentSdkLayerKey
+
+  TriggerUpgradeLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              This function only calls AWS service APIs (Secrets Manager, KMS,
+              SNS, EventBridge Scheduler, DevOps Agent) and GitHub over the
+              public internet; it accesses no VPC resources, so VPC attachment
+              would add NAT cost and cold-start latency with no security benefit.
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Function calls only AWS/GitHub APIs over the public internet; no
+              VPC resources are accessed, so VPC attachment adds cost/latency
+              with no security benefit.
+          - id: CKV_AWS_173
+            comment: >
+              Environment variables hold only resource references (Secrets
+              Manager ARNs, repo/topic/cluster names) — no secret material. The
+              actual secrets live in Secrets Manager, KMS-encrypted.
+    Properties:
+      FunctionName: !If
+        - HasSuffix
+        - !Sub devops-agent-trigger-upgrade-${NameSuffix}
+        - devops-agent-trigger-upgrade
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt TriggerUpgradeLambdaRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Layers:
+        - !Ref DevOpsAgentSdkLayer
+      Code:
+        ZipFile: |
+          import json, os, http.client, re, boto3
+          from datetime import datetime, timedelta, timezone
+
+          # Routing classifier. Two outcomes for completed investigations:
+          #   - The investigation produced a "## Mitigation Plan" section
+          #     (failure-investigation path: Root Cause + Immediate Steps +
+          #     Mitigation Plan, all in one agent run). Dispatch
+          #     next-steps.yml + SNS publish.
+          #   - The investigation produced a filled-in CDK Change Spec
+          #     (upgrade-planning path). Dispatch eks-upgrade.yml.
+          #   - Anything else is unknown — likely the agent stopped early
+          #     (e.g. emitted only Root Cause and stalled before Mitigation
+          #     Plan). Logged with a diagnostic dump, no side effects.
+          #
+          # Mitigation is checked FIRST so a failure investigation that
+          # quotes upstream upgrade context (CLUSTER_VERSION strings, etc.)
+          # never accidentally re-triggers an upgrade.
+          MITIGATION_HEADER = re.compile(r'(?:^|\n|\\n)\s*#{1,2}\s+Mitigation (?:Plan|Summary)\b', re.IGNORECASE)
+          CDK_SPEC_PATTERN = re.compile(r'CLUSTER_VERSION:\s*\d+\.\d+|(?:^|\n|\\n)\s*#{2,3}\s+CDK Change Spec\b', re.IGNORECASE)
+          ROOT_CAUSE_MARKER = re.compile(r'(?:^|\n|\\n)\s*###\s+Root Cause:?\b', re.IGNORECASE)
+          SKILL_UPDATE_SPEC = re.compile(r'(?:^|\n|\\n)\s*#{2,3}\s+Skill Update Spec\b', re.IGNORECASE)
+          CHANGES_FOUND_YES = re.compile(r'CHANGES_FOUND:\s*YES', re.IGNORECASE)
+
+          TASK_ID_PATTERN = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
+
+          UPGRADE_WORKFLOW = 'eks-upgrade.yml'
+          NEXT_STEPS_WORKFLOW = 'next-steps.yml'
+          SKILL_UPDATE_WORKFLOW = 'skill-update.yml'
+
+          def _list_journal_records(agent_space_id, execution_id):
+              """
+              Call aidevops:ListJournalRecords via boto3.
+
+              The runtime's bundled boto3 doesn't include the `devops-agent`
+              service model. The `devops-agent-sdk` Lambda layer ships only
+              the botocore model JSON (~26 KB), and AWS_DATA_PATH=/opt/botocore-models
+              tells the runtime's botocore where to find it. No full boto3
+              override needed.
+
+              The IAM service prefix is `aidevops` and the boto3 client name
+              is `devops-agent`. Both names refer to the same service.
+              """
+              client = boto3.client('devops-agent')
+              records = []
+              kwargs = dict(agentSpaceId=agent_space_id, executionId=execution_id, limit=100, order='ASC')
+              while True:
+                  resp = client.list_journal_records(**kwargs)
+                  records.extend(resp.get('records', []))
+                  next_token = resp.get('nextToken')
+                  if not next_token:
+                      break
+                  kwargs['nextToken'] = next_token
+              return records
+
+          # Common keys agents use to surface free-text content inside a
+          # structured journal-record `content` object. Order is intentional
+          # — earlier keys win.
+          _TEXT_KEYS = (
+              'text', 'value', 'content', 'message', 'body', 'output',
+              'summary', 'response', 'markdown', 'description', 'detail',
+          )
+
+          def _content_to_text(node):
+              """
+              Recursively pull free-text out of a journal record's `content`.
+
+              ListJournalRecords often returns content as a structured object
+              instead of a plain string — for example
+              {"type":"text","text":"...markdown..."} or
+              {"messages":[{"role":"assistant","content":"..."}, ...]}.
+
+              json.dumps()-ing those flattens real newlines into the literal
+              two-character sequence `\\n`, which breaks our line-anchored
+              regexes. Walk the structure instead and concatenate any text
+              we find, separated by real newlines so headings still match.
+              """
+              parts = []
+              if node is None:
+                  return ''
+              if isinstance(node, str):
+                  return node
+              if isinstance(node, (int, float, bool)):
+                  return str(node)
+              if isinstance(node, list):
+                  for item in node:
+                      sub = _content_to_text(item)
+                      if sub:
+                          parts.append(sub)
+                  return '\n'.join(parts)
+              if isinstance(node, dict):
+                  # Prefer well-known text keys to keep order natural.
+                  for key in _TEXT_KEYS:
+                      if key in node:
+                          sub = _content_to_text(node[key])
+                          if sub:
+                              parts.append(sub)
+                  # Recurse into the rest so we don't miss anything (e.g.
+                  # `messages: [...]` or arbitrary nested structures).
+                  for key, val in node.items():
+                      if key in _TEXT_KEYS:
+                          continue
+                      sub = _content_to_text(val)
+                      if sub:
+                          parts.append(sub)
+                  return '\n'.join(parts)
+              return str(node)
+
+          def _collect_findings(records):
+              """
+              Stitch the `content` of every journal record into one string,
+              preserving real newlines so the markdown-heading classifier
+              can match. Falls back to a json.dumps if extraction yields
+              nothing (rare, but ensures we never lose the record entirely).
+              """
+              parts = []
+              for rec in records or []:
+                  content = rec.get('content')
+                  if content is None:
+                      continue
+                  text = _content_to_text(content).strip()
+                  if not text:
+                      try:
+                          text = json.dumps(content, separators=(',', ':'))
+                      except (TypeError, ValueError):
+                          text = str(content)
+                  parts.append(text)
+              return '\n\n---\n\n'.join(parts)
+
+          # The journal record type carrying the agent's authoritative
+          # deliverable. Every execution emits exactly one; the other ~59
+          # records are `message` (the reasoning transcript) and
+          # `utilization` (token accounting).
+          RESULT_RECORD_TYPE = 'investigation_result'
+
+          def _extract_investigation_result(records):
+              """
+              Return the agent's final answer text, or None if absent.
+
+              Why this exists rather than heading-anchored slicing of the full
+              transcript: DevOps Agent re-styles the result record into Slack
+              mrkdwn. The agent writes the `### CDK Change Spec` heading the
+              skill asks for, and it survives verbatim in the `message`
+              record, but the platform rewrites ATX headings to *bold*, `---`
+              to U+2500 rules, and pipe tables to space-separated columns on
+              the way into `investigation_result`. So NO markdown-heading
+              regex can ever match this record — that is a property of the
+              platform, not agent drift, and it was equally true on runs that
+              succeeded. Anchoring on headings is therefore not fixable by a
+              better pattern.
+
+              What the platform does NOT touch is fenced code blocks: the
+              CDK Change Spec block is byte-identical in both records
+              (verified against real journals). eks-upgrade.yml already
+              anchors on a fence containing CLUSTER_VERSION rather than on a
+              heading, so handing it this record satisfies its contract
+              regardless of heading style.
+
+              Size matters too. The full stitched transcript runs ~185 KB,
+              four times the 45 KB cap in _dispatch_workflow, and the result
+              record sorts LAST (order='ASC') — so truncation decapitates
+              exactly the part the workflow needs. This record is ~3.8 KB and
+              fits with room to spare.
+
+              `content` arrives as a JSON *string*, e.g.
+              {"type": "investigation_result", "text": "...markdown..."}.
+              Prefer the `text` key: running _content_to_text over the parsed
+              dict also appends the `type` value ("investigation_result") as
+              trailing junk, since `type` is not in _TEXT_KEYS but the
+              catch-all recursion picks it up anyway.
+
+              Scans in reverse so the newest result wins when a task has
+              several executions (RCA and mitigation run under different
+              execution IDs and all_records concatenates them).
+              """
+              for rec in reversed(list(records or [])):
+                  if rec.get('recordType') != RESULT_RECORD_TYPE:
+                      continue
+                  content = rec.get('content')
+                  if content is None:
+                      continue
+                  if isinstance(content, str):
+                      try:
+                          content = json.loads(content)
+                      except (json.JSONDecodeError, TypeError):
+                          text = content.strip()
+                          if text:
+                              return text
+                          continue
+                  if isinstance(content, dict) and isinstance(content.get('text'), str):
+                      text = content['text'].strip()
+                  else:
+                      text = _content_to_text(content).strip()
+                  if text:
+                      return text
+              return None
+
+          def _classify(findings):
+              """
+              Returns 'mitigation' | 'skill_update' | 'upgrade' | 'incomplete' | 'unknown'.
+              Skill update is checked FIRST — its content often quotes
+              ## Mitigation Plan when documenting the mitigation contract,
+              which would otherwise false-match the mitigation path.
+              `incomplete` means the agent emitted Root Cause but never
+              reached a Mitigation Plan section (rare; logged for human
+              follow-up, no automated action).
+
+              The YES/NO test MUST run against the extracted spec, never
+              against the raw findings. The eks-skill-review SKILL.md is
+              echoed into the findings and its output template shows BOTH
+              the CHANGES_FOUND: YES and CHANGES_FOUND: NO examples — the
+              same echo that _is_skill_template_echo exists to reject. A
+              raw-findings search therefore matches the template's YES on
+              every run, so a genuine no-change review classified as
+              'skill_update', dispatched the workflow, and emailed
+              "changes detected" while skill_update_noop stayed unreachable.
+              (The workflow's own extractor is echo-aware and skipped the
+              PR correctly, so the visible symptom was a spurious SNS
+              notification, not a spurious PR.)
+              """
+              if SKILL_UPDATE_SPEC.search(findings):
+                  spec = _extract_skill_update_spec(findings)
+                  if spec is None:
+                      # No isolatable spec. Stay on the 'skill_update' path so
+                      # the dispatch sends the full findings and the workflow
+                      # fails loudly, rather than silently reporting no-op on
+                      # a review whose output we could not parse.
+                      return 'skill_update'
+                  if CHANGES_FOUND_YES.search(spec):
+                      return 'skill_update'
+                  return 'skill_update_noop'
+              if MITIGATION_HEADER.search(findings):
+                  return 'mitigation'
+              if CDK_SPEC_PATTERN.search(findings):
+                  return 'upgrade'
+              if ROOT_CAUSE_MARKER.search(findings):
+                  return 'incomplete'
+              return 'unknown'
+
+          def _extract_cluster_name(findings):
+              """Extract the EKS cluster name from investigation findings."""
+              m = re.search(r'eks-upgrade-poc[-\w]*', findings)
+              return m.group(0) if m else 'unknown'
+
+          def _extract_immediate_steps(findings):
+              """
+              Pull the agent's immediate mitigation action from the stitched
+              findings. The Mitigation Agent may use different heading styles:
+                - "## Immediate Steps" (legacy format)
+                - "## Action" (structured mitigation_summary tool output)
+
+              Returns the section body verbatim (without the heading),
+              trimmed, capped to a sane size for the SNS message body.
+              Returns None if neither heading is found.
+              """
+              for heading in ['Immediate Steps', 'Action']:
+                  section_re = re.compile(
+                      r'^##\s+' + heading + r'\s*\n(.*?)(?=^##\s+|\Z)',
+                      re.MULTILINE | re.DOTALL,
+                  )
+                  m = section_re.search(findings)
+                  if m:
+                      body = m.group(1).strip()
+                      if body:
+                          MAX_LEN = 2500
+                          if len(body) > MAX_LEN:
+                              body = body[:MAX_LEN].rstrip() + '\n...[truncated]'
+                          return body
+              return None
+
+          def _extract_rollback_section(findings):
+              """Extract the rollback step from the mitigation output.
+              Searches within the # Mitigation Summary record only to
+              avoid matching inside raw JSON journal blobs."""
+              # First isolate the Mitigation Summary section
+              summary_match = re.search(
+                  r'^# Mitigation Summary\s*\n(.*?)(?=^# [A-Z]|\Z)',
+                  findings, re.MULTILINE | re.DOTALL,
+              )
+              search_text = summary_match.group(1) if summary_match else findings[:50000]
+
+              pattern = re.compile(
+                  r'^###\s+Step \d+:\s*Rollback\s*\n(.*?)(?=^###\s+Step|^##\s+|\Z)',
+                  re.MULTILINE | re.DOTALL,
+              )
+              m = pattern.search(search_text)
+              if m:
+                  body = m.group(1).strip()
+                  return body[:2000] if len(body) > 2000 else body
+              return None
+
+          def _publish_mitigation_notification(task_id, exec_id, findings, cluster_name='unknown'):
+              """
+              Publish a concise mitigation notification with:
+              - Immediate action summary
+              - Rollback command (if applicable)
+              - Link to the full investigation in the DevOps Agent console
+              - Pointer to the code fix PR
+
+              The full execution plan and code change spec are available
+              in the investigation console and PR respectively.
+              """
+              topic_arn = os.environ.get('MITIGATION_TOPIC_ARN', '')
+              if not topic_arn:
+                  print("WARNING: MITIGATION_TOPIC_ARN not set; skipping SNS publish")
+                  return
+
+              action = _extract_immediate_steps(findings)
+              rollback = _extract_rollback_section(findings)
+              space_id = os.environ.get('AGENT_SPACE_ID', '')
+              investigation_url = f'https://{space_id}.aidevops.global.app.aws/investigation/{task_id}'
+
+              subject = f'EKS upgrade failure: {cluster_name} — mitigation plan'
+              lines = [
+                  f'EKS upgrade failure mitigation for cluster: {cluster_name}',
+                  '',
+                  f'Investigation: {investigation_url}',
+                  '',
+                  'IMMEDIATE MITIGATION:',
+              ]
+              if action:
+                  lines.append(action)
+              else:
+                  lines.append('(No immediate action produced. See investigation for details.)')
+
+              if rollback:
+                  lines.extend([
+                      '',
+                      'ROLLBACK (if needed):',
+                      rollback,
+                  ])
+
+              lines.extend([
+                  '',
+                  'NEXT STEPS:',
+                  'A code fix PR has been opened on the GitHub repo. Review and merge.',
+                  '',
+                  'Full execution plan and details available at:',
+                  investigation_url,
+              ])
+
+              message = '\n'.join(lines)
+
+              print(f"Publishing mitigation notification to {topic_arn}")
+              try:
+                  sns = boto3.client('sns')
+                  sns.publish(TopicArn=topic_arn, Subject=subject[:100], Message=message)
+              except Exception as exc:
+                  print(f"WARNING: SNS publish failed: {exc}")
+
+          def _publish_skill_update_notification(task_id, spec_content):
+              """
+              Publish skill update summary to the dedicated SNS topic.
+              Includes the changes found and instructions for next steps.
+              """
+              topic_arn = os.environ.get('SKILL_UPDATE_TOPIC_ARN', '')
+              if not topic_arn:
+                  print("WARNING: SKILL_UPDATE_TOPIC_ARN not set; skipping SNS publish")
+                  return
+
+              # Extract individual SKILL/DESCRIPTION lines for the summary
+              changes = re.findall(r'SKILL:\s*(.+?)(?:\n|\\n).*?DESCRIPTION:\s*(.+?)(?:\n|\\n)', spec_content, re.DOTALL)
+              change_lines = []
+              for skill, desc in changes:
+                  change_lines.append(f"- {skill.strip()}: {desc.strip()}")
+              if not change_lines:
+                  change_lines.append("- See PR for details")
+
+              subject = 'EKS Skill Update — changes detected'
+              lines = [
+                  'The daily EKS skill review found updates needed for pipeline skills.',
+                  '',
+                  f'Investigation task: {task_id}',
+                  '',
+                  'Changes detected:',
+              ] + change_lines + [
+                  '',
+                  'A PR has been opened on the GitHub repo with suggested edits.',
+                  'The workflow already rebuilt the skill zips into that PR.',
+                  '',
+                  'Action required:',
+                  '1. Review and approve the PR',
+                  '2. After merge, upload the changed zips to the DevOps Agent space',
+                  '   (Console > Settings > Skills > replace existing)',
+              ]
+              message = '\n'.join(lines)
+
+              print(f"Publishing skill update notification to {topic_arn}")
+              try:
+                  sns = boto3.client('sns')
+                  sns.publish(TopicArn=topic_arn, Subject=subject[:100], Message=message)
+              except Exception as exc:
+                  print(f"WARNING: SNS publish failed: {exc}")
+
+          def _extract_actionable_content(findings, kind):
+              """
+              Extract only the actionable section from the full investigation
+              findings. The GitHub workflow only needs the CDK Change Spec
+              (for upgrades) or the agent-ready spec (for mitigations) — not
+              the full investigation transcript with tool calls and thinking.
+
+              Anchors on REAL markdown headings only. The naive
+              `## Mitigation Plan.*` grab also matched backtick-quoted prose —
+              agents echo SKILL.md and other instruction files that *describe*
+              the contract ("emit a `## Mitigation Plan`, a `## Immediate
+              Steps`..."). When that prose sat earlier in the findings than the
+              real heading, the slice started mid-sentence, the real section was
+              discarded, and the 45 KB truncation in _dispatch_workflow then
+              removed every remaining heading — so the workflow received a
+              payload with no parseable section and stopped.
+
+              Two rules keep that from recurring:
+                - require start-of-line + a newline after the heading text, so
+                  an inline `## Mitigation Plan` backtick reference can't match;
+                - keep the LAST match (the agent's final answer), not the first,
+                  mirroring _extract_skill_update_spec.
+              """
+              if kind == 'upgrade':
+                  patterns = [
+                      r'^##[ \t]+EKS Upgrade Plan[ \t]*$',
+                      r'^###[ \t]+CDK Change Spec[ \t]*$',
+                  ]
+              elif kind == 'mitigation':
+                  patterns = [
+                      r'^#[ \t]+Mitigation Summary[ \t]*$',
+                      r'^##[ \t]+Mitigation Plan[ \t]*$',
+                  ]
+              else:
+                  return findings
+
+              # Match heading positions with MULTILINE (never DOTALL + greedy
+              # `.*`, which collapses to a single match running to end-of-string
+              # and would silently make matches[-1] the FIRST heading), then
+              # slice from the last one to the end.
+              for pattern in patterns:
+                  starts = [m.start() for m in re.finditer(pattern, findings, re.MULTILINE)]
+                  if starts:
+                      return findings[starts[-1]:]
+              return findings
+
+          def _strip_gutter(text):
+              """Drop a leading line-number gutter like "   77\\t" that some
+              journal renderings prepend when a file (e.g. the eks-skill-review
+              SKILL.md) is echoed back into the record."""
+              return '\n'.join(re.sub(r'^\s*\d+\t', '', ln) for ln in text.split('\n'))
+
+          # An unfilled <angle-bracket> placeholder, e.g. <date>, <skill-name>,
+          # <which section needs updating>. Deliberately lowercase-initial so a
+          # real value that happens to start with an XML/HTML-ish capitalised
+          # tag isn't mistaken for a placeholder.
+          _PLACEHOLDER = r'<[a-z][a-z0-9 _/-]*>'
+
+          def _is_skill_template_echo(block):
+              """The eks-skill-review SKILL.md is echoed into the findings,
+              including its output-contract TEMPLATE. That template uses
+              <angle-bracket> placeholders and shows BOTH the CHANGES_FOUND: YES
+              and CHANGES_FOUND: NO examples; a real agent spec has neither trait.
+
+              The YES/NO pair test alone is not enough. The template's two
+              examples are SEPARATE fenced blocks, each introduced by its own
+              `### Skill Update Spec` heading, so the extractor's section
+              strategy matches the NO example ALONE — one block, no YES, no
+              `SKILL:` line to catch. That echo therefore passed as a genuine
+              "all skills current" answer and silently converted "the agent
+              never answered" into a clean no-op review.
+
+              So also reject a block whose recognised field VALUES still hold
+              placeholders. SUGGESTED_EDIT bodies are exempt: real suggested
+              text legitimately contains angle brackets (the rollback command
+              in eks-failure-root-cause carries `<previous-version>`), and the
+              field-name anchor below keeps the check off those body lines.
+              """
+              if re.search(r'^\s*SKILL:\s*<', block, re.M):
+                  return True
+              placeholder_field = (
+                  r'^\s*(?:SKILL|SECTION|CHANGE_TYPE|DESCRIPTION|REVIEW_SUMMARY)'
+                  r':[^\n]*' + _PLACEHOLDER
+              )
+              if re.search(placeholder_field, block, re.M | re.I):
+                  return True
+              has_yes = re.search(r'CHANGES_FOUND:\s*YES', block, re.I)
+              has_no = re.search(r'CHANGES_FOUND:\s*NO', block, re.I)
+              return bool(has_yes and has_no)
+
+          def _extract_skill_update_spec(findings):
+              """
+              Return the agent's REAL Skill Update Spec from the stitched
+              findings, not the SKILL.md template echo.
+
+              The naive `### Skill Update Spec.*` grab matched the template echo
+              first (which appears near the top of the findings) and, because the
+              findings are ~160 KB, the real spec at the bottom was then dropped by
+              the _dispatch_workflow 45 KB truncation — so the GitHub workflow only
+              ever saw the placeholder template and stopped. Mirror the workflow's
+              extractor here so both agree: strip line-number gutters, gather ALL
+              candidate blocks (fenced + sectioned), discard template echoes, and
+              keep the LAST real spec (the agent's final answer). Falls back to the
+              CHANGES_FOUND: NO block when the review genuinely found nothing.
+              """
+              norm = findings.replace('\\n', '\n').replace('\\t', '\t')
+
+              def clean_fences(block):
+                  lines = block.split('\n')
+                  while lines and lines[0].strip().startswith('```'):
+                      lines.pop(0)
+                  while lines and lines[-1].strip().startswith('```'):
+                      lines.pop()
+                  return '\n'.join(lines).strip()
+
+              candidates = []
+              fence_re = re.compile(r'```[a-zA-Z]*\n(.*?)```', re.DOTALL)
+              for m in fence_re.finditer(norm):
+                  b = _strip_gutter(m.group(1)).strip()
+                  if 'CHANGES_FOUND' in b and 'SKILL:' in b:
+                      candidates.append(b)
+              section_re = re.compile(
+                  r'###\s+Skill Update Spec\s*\n(.*?)(?=\n###\s+|\n## |\Z)',
+                  re.DOTALL,
+              )
+              for m in section_re.finditer(norm):
+                  b = clean_fences(_strip_gutter(m.group(1)).strip())
+                  if 'CHANGES_FOUND' in b:
+                      candidates.append(b)
+
+              real = [b for b in candidates if not _is_skill_template_echo(b)]
+              if real:
+                  return real[-1]
+              # Only template echoes left. Return None — do NOT fall back to
+              # scanning `candidates` for a CHANGES_FOUND: NO block: the echoed
+              # SKILL.md carries its own NO example, so that fallback returned
+              # the template and laundered "the agent never answered" into "all
+              # skills are current", silently skipping a review. A genuine NO
+              # block needs no fallback anyway — it has neither a `SKILL: <`
+              # placeholder nor a YES line, so _is_skill_template_echo always
+              # passes it through to `real` above. skill-update.yml likewise
+              # treats echo-only findings as an error, so both halves of the
+              # extractor contract now agree.
+              return None
+
+          def _dispatch_workflow(workflow, summary, findings):
+              """
+              workflow_dispatch a GitHub Actions workflow with the
+              investigation summary + findings. Used for both eks-upgrade.yml
+              (CDK PR) and next-steps.yml (agent-ready spec PR).
+              """
+              MAX_FINDINGS = 45000
+              if len(findings) > MAX_FINDINGS:
+                  # Log which parseable markers the cut removes. Silent
+                  # truncation is how a payload reaches GitHub looking complete
+                  # while the section the workflow needs has been sliced off —
+                  # the workflow then fails with "no actionable spec found" and
+                  # the real cause is invisible from the Lambda logs.
+                  kept, dropped = findings[:MAX_FINDINGS], findings[MAX_FINDINGS:]
+                  lost = [
+                      mk for mk in (
+                          '# Agent-ready spec', '## Change requirements',
+                          '# Mitigation Summary', '## Mitigation Plan',
+                          '### CDK Change Spec', '### Skill Update Spec',
+                      )
+                      if mk in dropped and mk not in kept
+                  ]
+                  print(f"WARNING: findings length {len(findings)} > {MAX_FINDINGS}; truncating")
+                  if lost:
+                      print(
+                          f"WARNING: truncation dropped the only copy of these markers: "
+                          f"{lost} — the workflow will likely fail to extract a spec."
+                      )
+                  findings = kept + '\n[truncated]'
+
+              sm = boto3.client('secretsmanager')
+              token = sm.get_secret_value(SecretId=os.environ['GITHUB_TOKEN_SECRET'])['SecretString']  # checkov:skip=CKV_SECRET_6 SDK call, not a hardcoded secret
+              if token == 'PLACEHOLDER':
+                  raise ValueError("GitHub PAT not configured (see README Step 4).")
+
+              repo = os.environ['GITHUB_REPO']
+              payload = json.dumps({
+                  'ref': 'main',
+                  'inputs': {
+                      'investigation_summary': summary,
+                      'investigation_findings': findings,
+                  },
+              }).encode()
+
+              host = 'api.github.com'
+              path = f'/repos/{repo}/actions/workflows/{workflow}/dispatches'
+              conn = http.client.HTTPSConnection(host, timeout=20)
+              try:
+                  conn.request('POST', path, body=payload, headers={
+                      'Authorization': f'Bearer {token}',
+                      'Accept': 'application/vnd.github.v3+json',
+                      'Content-Type': 'application/json',
+                      'User-Agent': 'devops-agent-trigger-upgrade/1.0',
+                      'Host': host,
+                  })
+                  resp = conn.getresponse()
+                  resp_body = resp.read().decode()
+                  print(f"GitHub workflow_dispatch HTTP {resp.status} repo={repo} workflow={workflow}")
+                  if resp.status >= 400:
+                      raise RuntimeError(f"GitHub workflow_dispatch HTTP {resp.status}: {resp_body[:1000]}")
+              finally:
+                  conn.close()
+
+
+          def _extract_mitigation_spec(records):
+              """Extract the agent-ready spec from write_mitigation_code_spec tool call."""
+              for rec in records:
+                  content = rec.get('content', '')
+                  if not isinstance(content, str) or 'write_mitigation_code_spec' not in content:
+                      continue
+                  try:
+                      parsed = json.loads(content)
+                      for item in parsed.get('content', []):
+                          if isinstance(item, dict) and item.get('tool_name') == 'write_mitigation_code_spec':
+                              reqs = item['input']['requirements']
+                              lines = ['# Agent-ready spec', '',
+                                       'Once this incident is resolved, implement these changes in your source code and infrastructure definitions.', '']
+                              lines.append('## Change requirements\n')
+                              for i, req in enumerate(reqs, 1):
+                                  lines.append(f"{i}. **{req['objective']}**")
+                                  lines.append(f"   {req['description']}")
+                                  lines.append(f"   ")
+                                  lines.append(f"   **Acceptance criteria**")
+                                  for ac in req.get('acceptance_criteria', []):
+                                      lines.append(f"   \u2022 {ac}")
+                                  lines.append('')
+                              return '\n'.join(lines)
+                  except (json.JSONDecodeError, KeyError, TypeError):
+                      continue
+              return None
+
+          def _extract_execution_plan(records):
+              """Extract the Mitigation Summary (execution plan) for SNS.
+              Excludes the Code Change Specification section which goes to Kiro."""
+              for rec in records:
+                  content = rec.get('content', '')
+                  if isinstance(content, str) and content.startswith('# Mitigation Summary'):
+                      # Strip Code Change Specification section if present
+                      cut_markers = ['## Code Change Specification', '## Code Change', '### Requirements']
+                      for marker in cut_markers:
+                          idx = content.find(marker)
+                          if idx > 0:
+                              content = content[:idx].rstrip()
+                              break
+                      return content
+              return None
+
+          def _acquire_dispatch_lock(task_id, kind):
+              """
+              Prevent duplicate dispatches when both a native Investigation
+              Completed event and a scheduled poll hit the same task.
+              Uses a deterministic Scheduler schedule name as an atomic lock:
+              create_schedule with a known name succeeds only once; the second
+              caller gets ConflictException.
+              Returns True if this invocation owns the dispatch, False if
+              another already claimed it.
+              """
+              scheduler_role = os.environ.get('SCHEDULER_ROLE_ARN', '')
+              lambda_arn = os.environ.get('TRIGGER_LAMBDA_ARN', '')
+              if not scheduler_role or not lambda_arn:
+                  return True
+
+              lock_name = f"dispatch-lock-{task_id}-{kind}"[:64]
+              now = datetime.now(timezone.utc)
+              far_future = (now + timedelta(hours=1)).replace(second=0, microsecond=0)
+              try:
+                  scheduler = boto3.client('scheduler')
+                  scheduler.create_schedule(
+                      Name=lock_name,
+                      ScheduleExpression=f"at({far_future.strftime('%Y-%m-%dT%H:%M:%S')})",
+                      FlexibleTimeWindow={'Mode': 'OFF'},
+                      Target={
+                          'Arn': lambda_arn,
+                          'RoleArn': scheduler_role,
+                          'Input': json.dumps({'_noop': True}),
+                          'RetryPolicy': {
+                              'MaximumRetryAttempts': 0,
+                          },
+                      },
+                      ActionAfterCompletion='DELETE',
+                  )
+                  print(f"Acquired dispatch lock: {lock_name}")
+                  return True
+              except Exception as exc:
+                  if hasattr(exc, 'response') and exc.response.get('Error', {}).get('Code') == 'ConflictException':
+                      print(f"Dispatch lock already held: {lock_name} — skipping duplicate dispatch")
+                      return False
+                  print(f"WARNING: dispatch lock check failed ({exc}); proceeding with dispatch")
+                  return True
+
+          MAX_POLLING_ATTEMPTS = 30
+
+          def _publish_stalled_notification(space_id, task_id, attempts):
+              """Alert operators that mitigation polling exhausted its retry budget."""
+              topic_arn = os.environ.get('MITIGATION_TOPIC_ARN', '')
+              if not topic_arn:
+                  return
+              subject = 'EKS mitigation stalled — polling retries exhausted'
+              message = '\n'.join([
+                  f'Mitigation polling gave up after {attempts} attempts.',
+                  '',
+                  f'Task: {task_id}',
+                  f'Agent Space: {space_id}',
+                  '',
+                  'The mitigation execution did not produce routable output within the retry window.',
+                  'Manual investigation is required.',
+                  '',
+                  'Recommended actions:',
+                  '1. Check the DevOps Agent console for the mitigation execution status',
+                  '2. Review whether the execution is genuinely stuck or just slow',
+                  '3. Consider re-triggering the mitigation or resolving manually',
+              ])
+              try:
+                  sns = boto3.client('sns')
+                  sns.publish(TopicArn=topic_arn, Subject=subject[:100], Message=message)
+                  print(f"Published stalled notification for task={task_id}")
+              except Exception as exc:
+                  print(f"WARNING: SNS stalled notification failed: {exc}")
+
+          def _schedule_mitigation_check(event_payload, delay_minutes=5):
+              """
+              Schedule a one-shot re-invocation of this Lambda after a delay.
+              Used after calling PENDING_START so the Lambda wakes up after
+              mitigation completes and routes the output (SNS + GitHub).
+              Threads an attempt counter to prevent unbounded retry loops.
+              """
+              payload = dict(event_payload)
+              payload['_polling_attempt'] = payload.get('_polling_attempt', 0) + 1
+
+              if payload['_polling_attempt'] > MAX_POLLING_ATTEMPTS:
+                  space_id = payload.get('detail', {}).get('metadata', {}).get('agent_space_id', '')
+                  task_id = payload.get('detail', {}).get('metadata', {}).get('task_id', '')
+                  print(
+                      f"ERROR: exceeded max polling attempts ({MAX_POLLING_ATTEMPTS}) "
+                      f"for task={task_id}. Giving up."
+                  )
+                  _publish_stalled_notification(space_id, task_id, payload['_polling_attempt'] - 1)
+                  return
+
+              scheduler_role = os.environ.get('SCHEDULER_ROLE_ARN', '')
+              lambda_arn = os.environ.get('TRIGGER_LAMBDA_ARN', '')
+              if not scheduler_role or not lambda_arn:
+                  print("WARNING: SCHEDULER_ROLE_ARN or TRIGGER_LAMBDA_ARN not set; cannot schedule check")
+                  return
+
+              now = datetime.now(timezone.utc)
+              fire_at = (now + timedelta(minutes=delay_minutes)).replace(second=0, microsecond=0)
+              schedule_expr = f"at({fire_at.strftime('%Y-%m-%dT%H:%M:%S')})"
+
+              schedule_name = f"mitigation-check-{now.strftime('%Y%m%d%H%M%S')}"
+              try:
+                  scheduler = boto3.client('scheduler')
+                  scheduler.create_schedule(
+                      Name=schedule_name,
+                      ScheduleExpression=schedule_expr,
+                      FlexibleTimeWindow={'Mode': 'OFF'},
+                      Target={
+                          'Arn': lambda_arn,
+                          'RoleArn': scheduler_role,
+                          'Input': json.dumps(payload),
+                          'RetryPolicy': {
+                              'MaximumRetryAttempts': 0,
+                          },
+                      },
+                      ActionAfterCompletion='DELETE',
+                  )
+                  print(f"Scheduled mitigation check: {schedule_name} at {schedule_expr} (attempt {payload['_polling_attempt']})")
+              except Exception as exc:
+                  print(f"ERROR: failed to schedule mitigation check: {exc}")
+
+          def _classify_task_type(space_id, task_id):
+              """
+              Classify a task by its title into ('failure'|'upgrade'|'skill_update', title).
+              Used for timeout routing where journal records aren't available.
+              """
+              try:
+                  client = boto3.client('devops-agent')
+                  resp = client.get_backlog_task(agentSpaceId=space_id, taskId=task_id)
+                  title = resp.get('task', {}).get('title', '')
+              except Exception:
+                  title = ''
+              if 'skills review' in title.lower() or 'skill' in title.lower():
+                  return 'skill_update', title
+              if 'upgrade planning' in title.lower():
+                  return 'upgrade', title
+              return 'failure', title
+
+          def _publish_timeout_notification(space_id, task_id, kind, title):
+              """Publish SNS notification that an investigation timed out, routed by type."""
+              topic_arn = {
+                  'skill_update': os.environ.get('SKILL_UPDATE_TOPIC_ARN', ''),
+                  'upgrade': os.environ.get('MITIGATION_TOPIC_ARN', ''),
+                  'failure': os.environ.get('MITIGATION_TOPIC_ARN', ''),
+              }.get(kind, os.environ.get('MITIGATION_TOPIC_ARN', ''))
+
+              if not topic_arn:
+                  print(f"WARNING: No topic ARN set for kind={kind}; skipping timeout notification")
+                  return
+
+              subjects = {
+                  'failure': 'EKS failure investigation timed out — manual action required',
+                  'upgrade': 'EKS upgrade planning timed out — manual review needed',
+                  'skill_update': 'EKS skill review timed out — no action required',
+              }
+              bodies = {
+                  'failure': [
+                      'A failure investigation timed out before producing a root cause.',
+                      '',
+                      f'Task: {task_id}',
+                      f'Title: {title}',
+                      f'Agent Space: {space_id}',
+                      '',
+                      'The automated mitigation pipeline could not complete.',
+                      'Manual investigation is required.',
+                      '',
+                      'Likely causes:',
+                      '- Agent was blocked waiting for operator approval on read-only API calls',
+                      '- A sub-agent failed and the primary agent stalled waiting for it',
+                      '- Investigation exceeded the agent execution time limit',
+                      '',
+                      'Recommended actions:',
+                      '1. Check the DevOps Agent console for investigation details',
+                      '2. Review CloudFormation stack events manually',
+                      '3. Approve any pending operator approval requests',
+                      '4. Consider running the mitigation manually or re-triggering the failure Lambda',
+                  ],
+                  'upgrade': [
+                      'An upgrade planning investigation timed out.',
+                      '',
+                      f'Task: {task_id}',
+                      f'Title: {title}',
+                      f'Agent Space: {space_id}',
+                      '',
+                      'The agent did not produce an upgrade plan within the time limit.',
+                      'This is non-critical — the upgrade can be re-triggered or planned manually.',
+                      '',
+                      'Recommended actions:',
+                      '1. Check the DevOps Agent console for partial results',
+                      '2. Re-trigger the upgrade planning investigation if needed',
+                  ],
+                  'skill_update': [
+                      'A daily skill review timed out.',
+                      '',
+                      f'Task: {task_id}',
+                      f'Title: {title}',
+                      f'Agent Space: {space_id}',
+                      '',
+                      'This is informational only — the next scheduled review will run normally.',
+                      'No manual action is required unless timeouts persist.',
+                  ],
+              }
+
+              subject = subjects.get(kind, subjects['failure'])
+              message = '\n'.join(bodies.get(kind, bodies['failure']))
+              try:
+                  sns = boto3.client('sns')
+                  sns.publish(TopicArn=topic_arn, Subject=subject[:100], Message=message)
+                  print(f"Published timeout notification for task={task_id} kind={kind}")
+              except Exception as exc:
+                  print(f"WARNING: SNS timeout notification failed: {exc}")
+
+          def handler(event, context):
+              # Dispatch-lock schedules fire this Lambda ~1h later with a noop payload;
+              # return early so we don't record spurious Lambda errors.
+              if isinstance(event, dict) and event.get('_noop'):
+                  print("Dispatch-lock schedule fired (noop); no work to do.")
+                  return {'statusCode': 200, 'action': 'noop'}
+
+              polling_attempt = event.get('_polling_attempt', 0)
+              if polling_attempt:
+                  print(f"Polling re-invocation: attempt {polling_attempt}/{MAX_POLLING_ATTEMPTS}")
+
+              detail = event['detail']
+              space_id = detail['metadata']['agent_space_id']
+              task_id = detail['metadata']['task_id']
+              exec_id = detail['metadata'].get('execution_id', '')
+              status = detail['data'].get('status', '')
+
+              if not (isinstance(task_id, str) and TASK_ID_PATTERN.match(task_id)):
+                  print(f"ERROR: rejecting event with malformed task_id={task_id!r}")
+                  return {'statusCode': 400, 'action': 'rejected_malformed_task_id'}
+
+              # Handle timed-out investigations — classify and route to correct SNS topic
+              if status == 'TIMED_OUT':
+                  kind, task_title = _classify_task_type(space_id, task_id)
+                  print(f"Investigation timed out: task={task_id} kind={kind}")
+                  _publish_timeout_notification(space_id, task_id, kind, task_title)
+                  return {'statusCode': 200, 'taskId': task_id, 'action': f'timeout_alert_sent_{kind}'}
+
+              if status != 'COMPLETED':
+                  print(f"Ignoring task={task_id} status={status} (only COMPLETED or TIMED_OUT triggers routing)")
+                  return {'statusCode': 204}
+
+              if not exec_id:
+                  print(f"WARNING: task={task_id} has no execution_id; cannot fetch findings.")
+                  return {'statusCode': 204}
+
+              # Fetch journal records from ALL executions for this task.
+              # The mitigation agent runs under a separate execution ID from
+              # the RCA agent, but the Investigation Completed event only
+              # carries the RCA execution ID. To see the full picture we must
+              # check all executions.
+              all_records = []
+              client = None
+              try:
+                  client = boto3.client('devops-agent')
+                  execs_resp = client.list_executions(agentSpaceId=space_id, taskId=task_id)
+                  exec_ids = [e['executionId'] for e in execs_resp.get('executions', [])]
+                  if exec_id not in exec_ids:
+                      exec_ids.append(exec_id)
+              except Exception as exc:
+                  print(f"WARNING: list_executions failed ({exc}); falling back to event exec_id only")
+                  exec_ids = [exec_id]
+
+              for eid in exec_ids:
+                  print(f"Listing journal records for space={space_id} execution={eid}")
+                  try:
+                      records = _list_journal_records(space_id, eid)
+                      print(f"Got {len(records)} journal records from {eid}")
+                      all_records.extend(records)
+                  except Exception as exc:
+                      print(f"ERROR: ListJournalRecords failed for {eid}: {exc}")
+
+              if not all_records:
+                  print(f"ERROR: No journal records found across {len(exec_ids)} executions")
+                  raise RuntimeError("No journal records found")
+
+              findings = _collect_findings(all_records)
+
+              kind = _classify(findings)
+              print(f"Routing decision: investigation_type={kind}")
+
+              if kind == 'mitigation':
+                  if not _acquire_dispatch_lock(task_id, 'mitigation'):
+                      return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'mitigation', 'action': 'deduplicated'}
+                  cluster = _extract_cluster_name(findings)
+                  immediate_steps = _extract_immediate_steps(findings)
+                  has_code_spec = 'write_mitigation_code_spec' in findings or CDK_SPEC_PATTERN.search(findings)
+                  dispatched = None
+                  # Dispatch GitHub workflow only if there's a code spec
+                  if has_code_spec:
+                      summary = json.dumps({
+                          'agent_space_id': space_id,
+                          'task_id': task_id,
+                          'execution_id': exec_id,
+                          'summary_record_id': detail['data'].get('summary_record_id', ''),
+                          'status': status,
+                          'investigation_type': 'mitigation',
+                          'cluster_name': cluster,
+                      })
+                      # Prefer the structured agent-ready spec built from the
+                      # agent's write_mitigation_code_spec tool call. It is a
+                      # few hundred bytes of pure requirements, so it survives
+                      # the _dispatch_workflow size cap intact and matches the
+                      # workflow's Priority 1 extractor ('# Agent-ready spec' +
+                      # '## Change requirements'). Only if the tool call is
+                      # absent do we fall back to slicing the raw transcript.
+                      agent_spec = _extract_mitigation_spec(all_records)
+                      if agent_spec:
+                          actionable = agent_spec
+                          spec_source = 'agent-ready spec (write_mitigation_code_spec)'
+                      else:
+                          actionable = _extract_actionable_content(findings, 'mitigation')
+                          spec_source = 'sliced findings (no tool call found)'
+                      _dispatch_workflow(NEXT_STEPS_WORKFLOW, summary, actionable)
+                      dispatched = NEXT_STEPS_WORKFLOW
+                      print(
+                          f"Dispatched {NEXT_STEPS_WORKFLOW} (code spec found) "
+                          f"source={spec_source} bytes={len(actionable)}"
+                      )
+                  else:
+                      print("No code spec in mitigation output; skipping GitHub dispatch")
+                  # Publish to SNS only if there are immediate steps
+                  if immediate_steps:
+                      _publish_mitigation_notification(task_id, exec_id, findings, cluster)
+                  else:
+                      print("No immediate steps in mitigation output; skipping SNS")
+                  return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'mitigation', 'dispatched': dispatched}
+
+              if kind == 'skill_update':
+                  if not _acquire_dispatch_lock(task_id, 'skill_update'):
+                      return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'skill_update', 'action': 'deduplicated'}
+                  # Extract the agent's REAL spec (skipping the SKILL.md template
+                  # echo). The old greedy `### Skill Update Spec.*` grab matched
+                  # the template first and pushed the real spec past the 45 KB
+                  # dispatch truncation, so the workflow only saw the placeholder.
+                  # _classify already ran this extractor to decide YES vs no-op;
+                  # re-running it here keeps the two paths reading the same
+                  # source of truth rather than diverging on a threaded value.
+                  spec_content = _extract_skill_update_spec(findings)
+                  if not spec_content:
+                      print(f"WARNING: could not isolate a Skill Update Spec for task={task_id}; sending full findings")
+                      spec_content = findings
+                  summary = json.dumps({
+                      'agent_space_id': space_id,
+                      'task_id': task_id,
+                      'execution_id': exec_id,
+                      'summary_record_id': detail['data'].get('summary_record_id', ''),
+                      'status': status,
+                      'investigation_type': 'skill_update',
+                  })
+                  _dispatch_workflow(SKILL_UPDATE_WORKFLOW, summary, spec_content)
+                  _publish_skill_update_notification(task_id, spec_content)
+                  print(f"Dispatched {SKILL_UPDATE_WORKFLOW} + SNS for skill update")
+                  return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'skill_update', 'dispatched': SKILL_UPDATE_WORKFLOW}
+
+              if kind == 'skill_update_noop':
+                  print(f"Skill review task={task_id} found no changes. No PR or SNS needed.")
+                  return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'skill_update_noop', 'action': 'noop'}
+
+              if kind == 'upgrade':
+                  if not _acquire_dispatch_lock(task_id, 'upgrade'):
+                      return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'upgrade', 'action': 'deduplicated'}
+                  cluster = _extract_cluster_name(findings)
+                  # Prefer the investigation_result record — the agent's
+                  # authoritative deliverable, ~3.8 KB, carrying the CDK
+                  # Change Spec fence byte-identical to the transcript copy.
+                  # _extract_actionable_content is the fallback only: its
+                  # heading anchors do not match this record, whose ATX
+                  # headings arrive restyled as *bold*, and on a miss it
+                  # returns the full ~185 KB transcript, which the 45 KB
+                  # dispatch cap then truncates before the spec is reached.
+                  result_text = _extract_investigation_result(all_records)
+                  if result_text:
+                      actionable = result_text
+                      upgrade_source = f'{RESULT_RECORD_TYPE} record'
+                  else:
+                      actionable = _extract_actionable_content(findings, 'upgrade')
+                      upgrade_source = 'sliced findings (no result record found)'
+                  print(
+                      f"Upgrade payload source={upgrade_source} bytes={len(actionable)}"
+                  )
+                  summary = json.dumps({
+                      'agent_space_id': space_id,
+                      'task_id': task_id,
+                      'execution_id': exec_id,
+                      'summary_record_id': detail['data'].get('summary_record_id', ''),
+                      'status': status,
+                      'investigation_type': 'upgrade',
+                      'cluster_name': cluster,
+                  })
+                  _dispatch_workflow(UPGRADE_WORKFLOW, summary, actionable)
+                  return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'upgrade', 'dispatched': UPGRADE_WORKFLOW}
+
+              if kind == 'incomplete':
+                  # Root cause investigation completed but no Mitigation
+                  # Plan yet. Before triggering mitigation, check if a
+                  # mitigation execution already exists (to prevent loops
+                  # where the event fires before journal records are fully
+                  # written).
+                  if client is None:
+                      try:
+                          client = boto3.client('devops-agent')
+                      except Exception as exc:
+                          print(f"ERROR: devops-agent SDK unavailable ({exc}); cannot manage mitigation.")
+                          topic_arn = os.environ.get('MITIGATION_TOPIC_ARN', '')
+                          if topic_arn:
+                              try:
+                                  sns = boto3.client('sns')
+                                  sns.publish(
+                                      TopicArn=topic_arn,
+                                      Subject='EKS pipeline error — devops-agent SDK unavailable'[:100],
+                                      Message='\n'.join([
+                                          'The devops-agent SDK could not be loaded in the Trigger Lambda.',
+                                          '',
+                                          f'Task: {task_id}',
+                                          f'Agent Space: {space_id}',
+                                          '',
+                                          f'Error: {exc}',
+                                          '',
+                                          'The Lambda cannot start or poll mitigation without this SDK.',
+                                          'Check that the DevOpsAgentSdkLayer is attached and AWS_DATA_PATH is set.',
+                                      ]),
+                                  )
+                              except Exception:
+                                  pass
+                          return {'statusCode': 500, 'taskId': task_id, 'error': 'devops_agent_sdk_unavailable'}
+
+                  try:
+                      execs = client.list_executions(agentSpaceId=space_id, taskId=task_id)
+                      has_mitigation_exec = any(
+                          e.get('agentType') == 'mitigation'
+                          for e in execs.get('executions', [])
+                      )
+                  except Exception:
+                      has_mitigation_exec = False
+
+                  if has_mitigation_exec:
+                      TERMINAL_STATUSES = {'STOPPED', 'FAILED', 'CANCELED', 'TIMED_OUT'}
+                      mitigation_exec = next(
+                          (e for e in execs.get('executions', []) if e.get('agentType') == 'mitigation'),
+                          None
+                      )
+                      exec_status = mitigation_exec.get('executionStatus', '') if mitigation_exec else ''
+
+                      if exec_status in TERMINAL_STATUSES:
+                          if exec_status == 'STOPPED':
+                              # Mitigation finished but records weren't all
+                              # written when we last checked. Retry in 1 min.
+                              print(
+                                  f"Mitigation execution completed for task={task_id} "
+                                  f"but records not yet visible. Scheduling 1-min retry."
+                              )
+                              _schedule_mitigation_check(event, delay_minutes=1)
+                          else:
+                              # FAILED / CANCELED / TIMED_OUT — alert operators
+                              print(
+                                  f"ERROR: Mitigation execution ended with status={exec_status} "
+                                  f"for task={task_id}. Sending failure notification."
+                              )
+                              topic_arn = os.environ.get('MITIGATION_TOPIC_ARN', '')
+                              if topic_arn:
+                                  subject = f"EKS mitigation {exec_status.lower()} — manual action required"
+                                  message = '\n'.join([
+                                      f'Mitigation execution ended with terminal status: {exec_status}',
+                                      '',
+                                      f'Task: {task_id}',
+                                      f'Agent Space: {space_id}',
+                                      '',
+                                      'The automated mitigation pipeline did not complete successfully.',
+                                      'Manual investigation is required.',
+                                  ])
+                                  try:
+                                      sns = boto3.client('sns')
+                                      sns.publish(TopicArn=topic_arn, Subject=subject[:100], Message=message)
+                                      print(f"Published mitigation failure notification for task={task_id}")
+                                  except Exception as exc:
+                                      print(f"ERROR: SNS mitigation failure notification failed: {exc}")
+                      else:
+                          # Still running. Schedule a 3-min check.
+                          print(
+                              f"Mitigation execution in progress for task={task_id} "
+                              f"(status={exec_status}). Scheduling 3-min check."
+                          )
+                          _schedule_mitigation_check(event, delay_minutes=3)
+                      return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'incomplete', 'action': 'mitigation_already_running'}
+
+                  print(
+                      f"Root cause complete for task={task_id}, no Mitigation "
+                      f"Plan yet. Setting task to PENDING_START to trigger "
+                      f"mitigation agent."
+                  )
+                  try:
+                      client.update_backlog_task(
+                          agentSpaceId=space_id,
+                          taskId=task_id,
+                          taskStatus='PENDING_START',
+                      )
+                      print(f"update_backlog_task(PENDING_START) succeeded for task={task_id}")
+                  except Exception as exc:
+                      print(f"ERROR: start-mitigation failed for task={task_id}: {exc}")
+                      raise
+
+                  # Schedule a check after 5 minutes to pick up mitigation
+                  # output. The mitigation phase is not guaranteed to emit an
+                  # Investigation Completed event, so poll once instead of
+                  # waiting for one.
+                  _schedule_mitigation_check(event, delay_minutes=5)
+                  return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'incomplete', 'action': 'start-mitigation'}
+
+              print(f"NO-OP: task={task_id} produced no recognised marker (no Mitigation Plan, CDK Change Spec, or Root Cause). Skipping.")
+              # Diagnostic summary so we can see the shape the agent emitted
+              # when classification fails. Log only length + per-record key/type
+              # metadata (no payload content) — enough to spot a structured-
+              # content shape we don't yet handle in _content_to_text.
+              try:
+                  print(f"DIAG findings_len={len(findings)}")
+                  for i, rec in enumerate(records[:5]):
+                      keys = sorted(rec.keys()) if isinstance(rec, dict) else type(rec).__name__
+                      content = rec.get('content') if isinstance(rec, dict) else None
+                      ctype = type(content).__name__
+                      ckeys = sorted(content.keys()) if isinstance(content, dict) else None
+                      print(f"DIAG rec[{i}] keys={keys} content_type={ctype} content_keys={ckeys}")
+              except Exception as exc:
+                  print(f"DIAG: failed to print classifier diagnostics: {exc}")
+              return {'statusCode': 200, 'taskId': task_id, 'investigationType': 'unknown', 'action': 'noop'}
+      Environment:
+        Variables:
+          AWS_DATA_PATH: /opt/botocore-models
+          GITHUB_REPO: !Ref GitHubRepo
+          GITHUB_TOKEN_SECRET: !Ref GitHubTokenSecret
+          MITIGATION_TOPIC_ARN: !Ref MitigationNotificationTopic
+          SKILL_UPDATE_TOPIC_ARN: !Ref SkillUpdateNotificationTopic
+          AGENT_SPACE_ID: !GetAtt AgentSpace.AgentSpaceId
+          SCHEDULER_ROLE_ARN: !GetAtt TriggerSchedulerRole.Arn
+          TRIGGER_LAMBDA_ARN: !If
+            - HasSuffix
+            - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:devops-agent-trigger-upgrade-${NameSuffix}'
+            - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:devops-agent-trigger-upgrade'
+
+
+  TriggerUpgradeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerUpgradeLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InvestigationEventRule.Arn
+
+  InvestigationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !If
+        - HasSuffix
+        - !Sub devops-agent-investigation-events-${NameSuffix}
+        - devops-agent-investigation-events
+      EventPattern:
+        source:
+          - aws.aidevops
+        detail:
+          metadata:
+            agent_space_id:
+              - !GetAtt AgentSpace.AgentSpaceId
+      Targets:
+        - Id: TriggerUpgradeLambda
+          Arn: !GetAtt TriggerUpgradeLambda.Arn
+        - Id: EventBridgeLogGroup
+          Arn: !GetAtt EventBridgeLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
+  # Failure Lambda — fires on terminal CFN rollback.
+  #
+  # Single side effect: POST a webhook to the SAME agent space (single-space
+  # design) to open a brand-new failure-analysis investigation. The triage
+  # skill (eks-investigation-triage-rules) ensures the agent never links
+  # failure investigations to upgrade-planning investigations. The Failure
+  # RCA skill (eks-failure-root-cause) activates based on the incident
+  # description mentioning CloudFormation rollback. When the root-cause
+  # investigation completes, the Trigger Lambda detects the Root Cause
+  # marker and calls aidevops:UpdateBacklogTask(PENDING_START) to
+  # programmatically initiate the mitigation phase.
+  # ---------------------------------------------------------------------------
+  UpgradeFailureLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              Explicit role name is intentional; replacement on update is not
+              expected.
+    Properties:
+      RoleName: !If
+        - HasSuffix
+        - !Sub DevOpsAgent-UpgradeFailureLambda-${NameSuffix}
+        - DevOpsAgent-UpgradeFailureLambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadWebhookSecretAndDescribeStacks
+          # Lambda no longer dispatches workflows directly — only the Trigger
+          # Lambda holds the GitHub PAT now. Failure Lambda only needs:
+          #   - cloudformation:DescribeStacks for the InvestigationTaskId tag
+          #     (informational, included in the agent webhook description)
+          #   - secretsmanager:GetSecretValue for the agent webhook credentials
+          #     (same webhook as the Health Lambda — single agent space)
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !If
+                  - HasSuffix
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/EksUpgradePocStack-${NameSuffix}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/EksUpgradePocStack/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt SecretsKmsKey.Arn
+        - PolicyName: SendToDeadLetterQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  UpgradeFailureLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              This function only calls AWS service APIs (Secrets Manager, KMS,
+              CloudFormation, DevOps Agent); it accesses no VPC resources, so
+              VPC attachment would add NAT cost and cold-start latency with no
+              security benefit.
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Function calls only AWS service APIs; no VPC resources are
+              accessed, so VPC attachment adds cost/latency with no security
+              benefit.
+          - id: CKV_AWS_173
+            comment: >
+              Environment variables hold only resource references (Secrets
+              Manager ARNs, repo/topic/cluster names) — no secret material. The
+              actual secrets live in Secrets Manager, KMS-encrypted.
+    Properties:
+      FunctionName: !If
+        - HasSuffix
+        - !Sub devops-agent-upgrade-failure-event-${NameSuffix}
+        - devops-agent-upgrade-failure-event
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt UpgradeFailureLambdaRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json, os, hmac, hashlib, base64, urllib.request, urllib.error, boto3
+          from datetime import datetime, timezone
+
+          # Terminal rollback statuses only. With auto-rollback enabled (the
+          # default for `cdk deploy`), every UPDATE_FAILED / CREATE_FAILED
+          # transitions into one of these — so a single failed deploy yields
+          # exactly one event. The EventBridge rule below is kept in sync.
+          CFN_FAILURE_STATUSES = {
+              'ROLLBACK_FAILED',
+              'ROLLBACK_COMPLETE',
+              'UPDATE_ROLLBACK_FAILED',
+              'UPDATE_ROLLBACK_COMPLETE',
+          }
+
+          def _stack_tag(stack_name, key):
+              if not stack_name:
+                  return None
+              try:
+                  cfn = boto3.client('cloudformation')
+                  resp = cfn.describe_stacks(StackName=stack_name)
+                  for tag in resp['Stacks'][0].get('Tags', []):
+                      if tag.get('Key') == key:
+                          return tag.get('Value')
+              except Exception as exc:
+                  print(f"Could not read tag {key} from stack {stack_name}: {exc}")
+              return None
+
+          def _from_cfn(detail):
+              status = detail.get('status-details', {}).get('status') or detail.get('status')
+              raw_id = detail.get('stack-id', '')
+              stack_name = raw_id.split('/')[-2] if '/' in raw_id else raw_id
+              if status not in CFN_FAILURE_STATUSES:
+                  return None
+              # Skip nested stacks — CDK nested stacks emit their own
+              # rollback events that cascade from the parent. Only the
+              # parent stack has the full failure context (which addon
+              # failed, etc). Nested stack names contain the parent name
+              # plus a long suffix with "NestedStack" in it.
+              root_stack = os.environ.get('ROOT_STACK_PREFIX', 'EksUpgradePocStack')
+              if 'NestedStack' in stack_name or len(stack_name) > len(root_stack) + 25:
+                  print(f"Skipping nested stack rollback: {stack_name}")
+                  return None
+              # Ownership guard. CfnStackFailureRule matches every
+              # CloudFormation rollback in the account — it carries no
+              # stack-id filter. When more than one copy of this template is
+              # deployed (multiple NameSuffix instances, or a customer running
+              # several EKS stacks side by side), a single rollback fans out to
+              # EVERY deployment's rule, and each one opens its own
+              # investigation in its own agent space. Downstream that becomes N
+              # duplicate next-steps.yml dispatches for one failure; the
+              # dispatch lock cannot dedupe them because each space produces a
+              # different task_id.
+              #
+              # ROOT_STACK_PREFIX already declares which stack this deployment
+              # owns — enforce it here so each deployment reacts only to its
+              # own stack. Exact match: the nested-stack check above has
+              # already excluded this stack's own children, and an unsuffixed
+              # 'EksUpgradePocStack' must not claim 'EksUpgradePocStack-t19'.
+              if stack_name != root_stack:
+                  print(
+                      f"Ignoring rollback for stack {stack_name}: this deployment "
+                      f"owns {root_stack}. Another deployment's failure detector "
+                      f"handles it."
+                  )
+                  return None
+              return {
+                  'source': 'cloudformation',
+                  'stackName': stack_name,
+                  'clusterName': None,
+                  'failureDetail': {
+                      'status': status,
+                      'reason': detail.get('status-details', {}).get('status-reason'),
+                      'resource': detail.get('logical-resource-id'),
+                      'resourceType': detail.get('resource-type'),
+                  },
+                  # Tag is informational only — we don't link the new
+                  # investigation to it. Kept in the description for human
+                  # audit trail.
+                  'originalUpgradeTaskId': _stack_tag(stack_name, 'InvestigationTaskId'),
+              }
+
+          def _post_webhook(webhook_url, webhook_secret, body):
+              payload = json.dumps(body)
+              now = datetime.now(timezone.utc)
+              timestamp = now.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+              sig = base64.b64encode(
+                  hmac.new(webhook_secret.encode(), f"{timestamp}:{payload}".encode(), hashlib.sha256).digest()
+              ).decode()
+              req = urllib.request.Request(webhook_url, data=payload.encode(), headers={
+                  'Content-Type': 'application/json',
+                  'x-amzn-event-timestamp': timestamp,
+                  'x-amzn-event-signature': sig,
+              }, method='POST')
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      print(f"Webhook OK: status={resp.status}")
+              except urllib.error.HTTPError as e:
+                  body_text = e.read().decode(errors='replace')[:1000]
+                  print(f"ERROR: webhook POST {e.code}: {body_text}")
+                  raise
+              except Exception as exc:
+                  print(f"ERROR: webhook POST failed: {exc}")
+                  raise
+
+          def handler(event, context):
+              src = event.get('source', '')
+              detail = event.get('detail', {})
+              info = _from_cfn(detail) if src == 'aws.cloudformation' else None
+              if not info:
+                  print(f"Ignoring event from {src} (not a tracked failure)")
+                  return {'statusCode': 204}
+
+              now = datetime.now(timezone.utc)
+              iso_ts = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+              cluster = info['clusterName'] or os.environ.get('DEFAULT_CLUSTER_NAME', 'unknown')
+              region = os.environ.get('AWS_REGION', 'us-east-1')
+
+              sm = boto3.client('secretsmanager')
+              creds = json.loads(sm.get_secret_value(SecretId=os.environ['WEBHOOK_SECRET'])['SecretString'])  # checkov:skip=CKV_SECRET_6 SDK call, not a hardcoded secret
+              webhook_url = creds['url']
+              webhook_secret = creds['secret']
+              if webhook_url == 'PLACEHOLDER' or webhook_secret == 'PLACEHOLDER':
+                  raise ValueError("Webhook secret not configured. Update the secret in Secrets Manager (see README Step 3).")
+
+              # Open a brand new failure investigation. The agent's
+              # output goes into journal records. The prompt asks the agent
+              # to produce a Root Cause analysis. When the investigation
+              # completes, the Trigger Lambda detects the Root Cause marker
+              # and calls aidevops:StartMitigation to programmatically
+              # initiate the mitigation phase. The mitigation completion
+              # then triggers next-steps.yml + SNS publish.
+              title = f"EKS upgrade failed: {cluster} ({region}) — {iso_ts}"
+              description_lines = [
+                  f"An EKS upgrade deploy failed on cluster {cluster}.",
+                  "",
+                  f"Source: {info['source']}",
+                  f"Cluster: {cluster}",
+                  f"Region: {region}",
+                  f"Date and time of incident: {iso_ts}",
+              ]
+              if info['stackName']:
+                  description_lines.append(f"CloudFormation stack: {info['stackName']}")
+              if info.get('originalUpgradeTaskId'):
+                  description_lines.append(
+                      f"Originating upgrade investigation (informational, NOT linked): {info['originalUpgradeTaskId']}"
+                  )
+              description_lines.append("")
+              description_lines.append(f"Failure detail: {json.dumps(info['failureDetail'])}")
+              description_lines.append("")
+              description_lines.append(
+                  "Investigate the root cause of this failure. Inspect "
+                  "CloudFormation events, EKS cluster state, addon versions, "
+                  "and any related AWS Health events to determine what went "
+                  "wrong.\n\n"
+                  "Your output MUST include the following section with this "
+                  "exact header so downstream automation can parse it:\n\n"
+                  "### Root Cause:\n"
+                  "A concise root-cause statement (one or two sentences) "
+                  "followed by the supporting evidence you used to reach it.\n\n"
+                  "Do NOT include a Mitigation Plan or CDK Change Spec — "
+                  "mitigation will be initiated programmatically after your "
+                  "root cause analysis completes."
+              )
+              description = '\n'.join(description_lines)
+
+              incident_id = f"eks-upgrade-failure-{now.strftime('%Y%m%d%H%M%S')}"
+              body = {
+                  'eventType': 'incident',
+                  'incidentId': incident_id,
+                  'action': 'created',
+                  'priority': 'HIGH',
+                  'title': title,
+                  'description': description,
+                  'timestamp': now.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
+                  'service': info['source'],
+                  'data': {
+                      'failureSource': info['source'],
+                      'clusterName': cluster,
+                      'stackName': info['stackName'],
+                      'failureDetail': info['failureDetail'],
+                  },
+              }
+              print(f"Opening failure-analysis investigation (unlinked): incident_id={incident_id} cluster={cluster}")
+              _post_webhook(webhook_url, webhook_secret, body)
+              return {'statusCode': 200, 'cluster': cluster, 'source': info['source'], 'incidentId': incident_id}
+      Environment:
+        Variables:
+          WEBHOOK_SECRET: !Ref WebhookSecret
+          DEFAULT_CLUSTER_NAME: !If
+            - HasSuffix
+            - !Sub ${ClusterName}-${NameSuffix}
+            - !Ref ClusterName
+          ROOT_STACK_PREFIX: !If
+            - HasSuffix
+            - !Sub EksUpgradePocStack-${NameSuffix}
+            - EksUpgradePocStack
+
+  UpgradeFailureLambdaPermissionCfn:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpgradeFailureLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CfnStackFailureRule.Arn
+
+  CfnStackFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !If
+        - HasSuffix
+        - !Sub eks-cfn-stack-failure-${NameSuffix}
+        - eks-cfn-stack-failure
+      Description: >
+        Catches the single terminal rollback status emitted at the end of a
+        failed EKS upgrade deploy. Auto-rollback (the default for `cdk deploy`)
+        guarantees that any UPDATE_FAILED / CREATE_FAILED is followed by an
+        UPDATE_ROLLBACK_* / ROLLBACK_* terminal state. By matching only the
+        rollback terminals, a single failed deploy produces exactly one event.
+      EventPattern:
+        source:
+          - aws.cloudformation
+        detail-type:
+          - CloudFormation Stack Status Change
+        detail:
+          status-details:
+            status:
+              - ROLLBACK_FAILED
+              - ROLLBACK_COMPLETE
+              - UPDATE_ROLLBACK_FAILED
+              - UPDATE_ROLLBACK_COMPLETE
+      Targets:
+        - Id: UpgradeFailureLambda
+          Arn: !GetAtt UpgradeFailureLambda.Arn
+        - Id: EventBridgeLogGroup
+          Arn: !GetAtt EventBridgeLogGroup.Arn
+
+Outputs:
+  AgentSpaceId:
+    Value: !GetAtt AgentSpace.AgentSpaceId
+  AgentSpaceArn:
+    Value: !GetAtt AgentSpace.Arn
+  OperatorAppUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/devopsagent/home?region=${AWS::Region}#/spaces/${AgentSpace.AgentSpaceId}
+  HealthEventLambdaName:
+    Value: !Ref HealthEventLambda
+    Description: Function name for the smoke-test 'aws lambda invoke' command.
+  TriggerUpgradeLambdaName:
+    Value: !Ref TriggerUpgradeLambda
+    Description: Trigger Lambda — routes Investigation Completed events. Dispatches eks-upgrade.yml on upgrade-planning completions; dispatches next-steps.yml + publishes to SNS on failure-investigation completions (Mitigation Plan marker).
+  UpgradeFailureLambdaName:
+    Value: !Ref UpgradeFailureLambda
+    Description: Failure detector — opens an unlinked failure-analysis investigation on the agent (no GitHub dispatch).
+  EventBridgeLogGroupName:
+    Value: !Ref EventBridgeLogGroup
+    Description: Shared log group capturing all EventBridge events matched by the pipeline's rules.
+  WebhookSecretName:
+    Value: !Ref WebhookSecret
+  GitHubTokenSecretName:
+    Value: !Ref GitHubTokenSecret
+  MitigationNotificationTopicArn:
+    Value: !Ref MitigationNotificationTopic
+    Description: >
+      SNS topic that receives "## Immediate Steps" notifications when a
+      failure investigation completes (Mitigation Plan marker found).
+      Subscribe email/Slack/SMS endpoints with `aws sns subscribe` after
+      the stack is deployed.
+  SkillUpdateNotificationTopicArn:
+    Value: !Ref SkillUpdateNotificationTopic
+    Description: >
+      SNS topic that receives notifications when the daily skill review
+      finds updates needed. Subscribe to get alerted about skill update PRs.
+  SkillReviewLambdaName:
+    Value: !Ref SkillReviewLambda
+    Description: Skill review kickoff Lambda — runs daily, fetches skills from GitHub, and triggers an eks-skill-review investigation.

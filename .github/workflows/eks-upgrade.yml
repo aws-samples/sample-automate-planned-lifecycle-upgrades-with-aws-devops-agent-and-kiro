@@ -1,0 +1,311 @@
+name: EKS Upgrade
+
+run-name: "EKS Upgrade: ${{ fromJSON(inputs.investigation_summary || '{}').cluster_name || 'unknown' }} (#${{ github.run_number }})"
+
+# Triggered by the Trigger Lambda via workflow_dispatch when an upgrade-planning
+# investigation completes on the DevOps Agent.
+#
+# Inputs come from the Trigger Lambda (devops-agent-trigger-upgrade), which:
+#   - Reads the EventBridge `Investigation Completed` event metadata to build
+#     `investigation_summary` (agent_space_id, task_id, execution_id, status, ...).
+#   - Calls aidevops:ListJournalRecords(agentSpaceId, executionId) on the
+#     DevOps Agent REST API and stitches every record's `content` field into
+#     `investigation_findings`. This is the actual investigation output —
+#     including the `CDK Change Spec` block the skill emits.
+#
+# Trust boundary: both inputs originate from our Lambda. The summary is
+# validated as JSON before use; findings are validated and the CDK Change
+# Spec is extracted to a clean file before being passed to Kiro CLI.
+
+on:
+  # checkov:skip=CKV_GHA_7: workflow_dispatch inputs are required — the Trigger Lambda
+  # passes the investigation summary and findings that drive the CDK upgrade.
+  workflow_dispatch:
+    inputs:
+      investigation_summary:
+        description: JSON metadata blob from the Trigger Lambda (agent_space_id, task_id, execution_id, status, investigation_type)
+        required: true
+        type: string
+      investigation_findings:
+        description: Stitched journal records from the agent's investigation (includes the CDK Change Spec)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+
+      - name: Validate investigation_summary input
+        env:
+          INVESTIGATION_SUMMARY: ${{ inputs.investigation_summary }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          raw = os.environ.get('INVESTIGATION_SUMMARY', '')
+          try:
+              data = json.loads(raw)
+          except (json.JSONDecodeError, TypeError) as e:
+              print(f"ERROR: investigation_summary is not valid JSON: {e}", file=sys.stderr)
+              sys.exit(1)
+          required = ['agent_space_id', 'task_id', 'status']
+          missing = [k for k in required if k not in data]
+          if missing:
+              print(f"ERROR: investigation_summary missing required fields: {missing}", file=sys.stderr)
+              sys.exit(1)
+          print(f"Validated: task_id={data['task_id']} status={data['status']}")
+          PY
+
+      - name: Write investigation findings to file
+        env:
+          INVESTIGATION_FINDINGS: ${{ inputs.investigation_findings }}
+        run: |
+          echo "$INVESTIGATION_FINDINGS" > /tmp/investigation-findings.md
+          echo "Wrote $(wc -c < /tmp/investigation-findings.md) bytes to /tmp/investigation-findings.md"
+
+      - name: Extract and validate CDK Change Spec
+        env:
+          INVESTIGATION_SUMMARY: ${{ inputs.investigation_summary }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+
+          findings_path = pathlib.Path('/tmp/investigation-findings.md')
+          if not findings_path.exists() or findings_path.stat().st_size == 0:
+              print("::error::EKS upgrade pipeline STOPPED — investigation findings file is empty or missing.")
+              sys.exit(1)
+
+          raw = findings_path.read_text()
+
+          # The stitched findings may contain literal \n / \t from JSON-escaped
+          # agent content. Normalize to real newlines so regex can match.
+          findings = raw.replace('\\n', '\n').replace('\\t', '\t')
+
+          # --- Extract every fenced code block containing CLUSTER_VERSION ---
+          fence_re = re.compile(r'```[a-zA-Z]*\n(.*?)```', re.DOTALL)
+          candidates = [m.group(1).strip() for m in fence_re.finditer(findings)
+                        if 'CLUSTER_VERSION' in m.group(1)]
+
+          if not candidates:
+              print("::error::EKS upgrade pipeline STOPPED — no CDK Change Spec code block found in findings.")
+              sys.exit(1)
+
+          # --- Validate each candidate against the strict contract ---
+          PLACEHOLDER = re.compile(r'[<>]|e\.g\.')
+
+          def validate(block):
+              """Return list of rejection reasons; empty = valid."""
+              reasons = []
+              if PLACEHOLDER.search(block):
+                  reasons.append("contains placeholder markers (< > or 'e.g.')")
+              cv = re.search(r'^CLUSTER_VERSION:\s*(.+)$', block, re.M)
+              if not cv or not re.fullmatch(r'\d+\.\d+', cv.group(1).strip()):
+                  reasons.append(f"CLUSTER_VERSION not resolved: {cv.group(1).strip() if cv else 'MISSING'}")
+              kl = re.search(r'^KUBECTL_LAYER_PACKAGE:\s*(.+)$', block, re.M)
+              if not kl or not re.fullmatch(r'@aws-cdk/lambda-layer-kubectl-v\d+', kl.group(1).strip()):
+                  reasons.append(f"KUBECTL_LAYER_PACKAGE not resolved: {kl.group(1).strip() if kl else 'MISSING'}")
+              for am in re.finditer(r'^ADDON\s+\S+:\s*(.+)$', block, re.M):
+                  val = am.group(1).strip()
+                  if val == 'NOT_INSTALLED':
+                      continue
+                  if not re.fullmatch(r'v\d+\.\d+\.\d+-eksbuild\.\d+', val):
+                      reasons.append(f"ADDON value not resolved: {val}")
+              feas = re.search(r'^FEASIBILITY:\s*(\S+)', block, re.M)
+              if not feas:
+                  reasons.append("FEASIBILITY field missing")
+              elif feas.group(1).strip() != 'READY':
+                  reasons.append(f"FEASIBILITY is {feas.group(1)} (must be READY to proceed)")
+              return reasons
+
+          valid_blocks = []
+          for block in candidates:
+              reasons = validate(block)
+              if not reasons:
+                  valid_blocks.append(block)
+              else:
+                  print(f"Rejected candidate: {'; '.join(reasons)}")
+
+          # Deduplicate by normalized whitespace
+          unique = []
+          seen = set()
+          for b in valid_blocks:
+              key = re.sub(r'\s+', '', b)
+              if key not in seen:
+                  seen.add(key)
+                  unique.append(b)
+
+          # --- Decision ---
+          summary_raw = os.environ.get('INVESTIGATION_SUMMARY', '{}')
+          try:
+              summary = json.loads(summary_raw)
+          except (json.JSONDecodeError, TypeError):
+              summary = {}
+          cluster = summary.get('cluster_name', 'unknown')
+          task_id = summary.get('task_id', 'unknown')
+
+          if len(unique) == 0:
+              print("::error::EKS upgrade pipeline STOPPED — no valid CDK Change Spec found.")
+              print(
+                  f"ERROR: CDK Change Spec could not be validated.\n\n"
+                  f"Cluster: {cluster}\n"
+                  f"Task ID: {task_id}\n\n"
+                  f"The investigation findings contained {len(candidates)} spec block(s) but none "
+                  f"passed validation (all had placeholders, unresolved values, or FEASIBILITY != READY).\n\n"
+                  f"Action required: inspect the investigation in the DevOps Agent console "
+                  f"and re-run this workflow manually once the issue is resolved.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if len(unique) > 1:
+              print("::error::EKS upgrade pipeline STOPPED — multiple conflicting CDK Change Specs found.")
+              print(
+                  f"ERROR: Found {len(unique)} conflicting valid spec blocks.\n\n"
+                  f"Cluster: {cluster}\n"
+                  f"Task ID: {task_id}\n\n"
+                  f"The pipeline cannot choose between conflicting specs. "
+                  f"Inspect the investigation and re-run manually.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          # Exactly one valid spec — write it to a clean file for Kiro.
+          spec = unique[0]
+          spec_path = pathlib.Path('/tmp/cdk-change-spec.txt')
+          spec_path.write_text(spec + '\n')
+          print(f"CDK Change Spec validated and extracted ({spec_path}, {len(spec)} bytes).")
+          print(f"  Cluster: {cluster} | FEASIBILITY: READY")
+          cv = re.search(r'^CLUSTER_VERSION:\s*(.+)$', spec, re.M)
+          print(f"  Target version: {cv.group(1).strip()}")
+          PY
+
+      - name: Install Kiro CLI
+        env:
+          KIRO_MIN_VERSION: "1.0.3"
+        run: |
+          curl -fsSL https://cli.kiro.dev/install -o /tmp/kiro-install.sh
+          chmod +x /tmp/kiro-install.sh
+          bash /tmp/kiro-install.sh
+          rm -f /tmp/kiro-install.sh
+          installed=$(kiro-cli --version | awk '{print $NF}')
+          if [ "$(printf '%s\n' "$KIRO_MIN_VERSION" "$installed" | sort -V | head -n1)" != "$KIRO_MIN_VERSION" ]; then
+            echo "ERROR: Kiro CLI ${installed} is older than minimum ${KIRO_MIN_VERSION}"
+            exit 1
+          fi
+          if [ "$installed" != "$KIRO_MIN_VERSION" ]; then
+            echo "::warning::Kiro CLI ${installed} is newer than tested ${KIRO_MIN_VERSION} — verify compatibility and update KIRO_MIN_VERSION"
+          fi
+
+      - name: Run Kiro CLI to modify CDK
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+        run: |
+          kiro-cli chat --no-interactive --trust-tools=read,write,glob,grep \
+            "Read kiro-cdk-instructions.md for context on the CDK patterns. Then read /tmp/cdk-change-spec.txt — it contains the validated CDK Change Spec extracted from the DevOps Agent investigation. Apply those values exactly. Modify lib/iteration3-stack.ts ONLY. Do NOT edit package.json or package-lock.json — a later workflow step swaps the kubectl layer dependency using npm, which is the only component that can resolve its published version. Do NOT derive or guess version numbers — use only the values from the spec file. Make only the file edits — do not run any build or shell commands, and do not commit."
+
+      - name: Enforce file-change allowlist
+        run: |
+          # Kiro's remit is the TypeScript only. package.json is swapped by the
+          # next step, AFTER this audit, so its edits are never laundered
+          # through the allowlist.
+          ALLOWED='^lib/iteration3-stack\.ts$'
+          changed=$(git diff --name-only)
+          bad=$(echo "$changed" | grep -vE "$ALLOWED" || true)
+          if [ -n "$bad" ]; then
+            echo "ERROR: Kiro modified files outside the allowlist:"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Swap kubectl layer dependency
+        run: |
+          # The kubectl layer packages (@aws-cdk/lambda-layer-kubectl-v30, -v31,
+          # ...) are independently versioned siblings: v30 tops out at 2.0.4
+          # while v31 jumps 2.0.3 -> 2.1.0. A version number NEVER transfers
+          # between them, so the spec deliberately carries only the package
+          # NAME. Neither the DevOps Agent (no network tool — AWS APIs and file
+          # reads only) nor Kiro (--trust-tools=read,write,glob,grep) can look
+          # up which versions exist, so npm resolves it here instead.
+          NEW=$(grep -oE '^KUBECTL_LAYER_PACKAGE:[[:space:]]*\S+' /tmp/cdk-change-spec.txt \
+                | awk '{print $2}')
+          if [ -z "$NEW" ]; then
+            echo "::error::KUBECTL_LAYER_PACKAGE missing from /tmp/cdk-change-spec.txt"
+            exit 1
+          fi
+
+          # The outgoing package is whatever kubectl layer is currently pinned,
+          # so it needn't be plumbed through the spec. Guard on the result
+          # explicitly: `set -e` does not abort on a failed command
+          # substitution, and an empty OLD would turn the delete below into
+          # `npm pkg delete dependencies.`, wiping every dependency.
+          OLD=$(node -e "
+            const d = require('./package.json').dependencies || {};
+            const k = Object.keys(d).filter(x => /^@aws-cdk\/lambda-layer-kubectl-v\d+$/.test(x));
+            if (k.length !== 1) { console.error('expected exactly 1 kubectl layer dep, found ' + k.length); process.exit(1); }
+            console.log(k[0]);
+          ") || true
+          if [ -z "$OLD" ]; then
+            echo "::error::could not identify the outgoing kubectl layer dependency in package.json"
+            exit 1
+          fi
+
+          if [ "$OLD" = "$NEW" ]; then
+            echo "kubectl layer already $OLD — no swap needed."
+            exit 0
+          fi
+
+          echo "Swapping $OLD -> $NEW (npm resolves the version)"
+          npm pkg delete "dependencies.$OLD"
+          npm install --save-exact "$NEW"
+
+          RESOLVED=$(node -e "console.log((require('./package.json').dependencies || {})['$NEW'] || '')")
+          if [ -z "$RESOLVED" ]; then
+            echo "::error::npm did not pin a version for $NEW"
+            exit 1
+          fi
+          echo "Resolved $NEW@$RESOLVED"
+
+      - name: Validate CDK changes
+        run: |
+          npm install
+          npm run build
+          npx cdk synth --quiet
+
+      - name: Create pull request
+        id: cpr
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          branch: upgrade/eks-automated-${{ github.run_id }}
+          title: "feat(eks): Upgrade ${{ fromJSON(inputs.investigation_summary).cluster_name || 'eks-cluster' }} (#${{ github.run_number }})"
+          labels: |
+            eks-upgrade
+            automated
+          body: |
+            Automated EKS upgrade PR generated by Kiro CLI.
+
+            **⚠️ Rollback window:** Control plane upgrades are reversible for 7 days via EKS version rollback. After the window closes, the upgrade is permanent.
+
+            ### Reviewer checklist
+            - [ ] Version numbers correct for all components
+            - [ ] `cdk diff` shows **Modify**, never **Replace**
+            - [ ] Addon versions compatible with target Kubernetes version
+
+            ### Machine-readable correlation (do not remove)
+
+            The post-merge deploy workflow parses this block to tag the CloudFormation
+            stack with the investigation task ID. Keep this block intact.
+
+            <!-- investigation-context-start -->
+            ```json
+            ${{ inputs.investigation_summary }}
+            ```
+            <!-- investigation-context-end -->

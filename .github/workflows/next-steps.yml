@@ -1,0 +1,258 @@
+name: Next Steps Agent-ready Spec (Kiro CLI)
+
+run-name: "Failure Fix: ${{ fromJSON(inputs.investigation_summary || '{}').cluster_name || 'unknown' }} (#${{ github.run_number }})"
+
+# Triggered by the Trigger Lambda via workflow_dispatch when a DevOps Agent
+# MITIGATION PLAN investigation completes. The mitigation investigation is
+# itself opened by the Trigger Lambda after a failure-analysis investigation
+# identifies a Root Cause from a CloudFormation rollback. That two-step agent
+# flow (failure-analysis → mitigation-plan) lives entirely on the agent, not
+# in CDK. This workflow takes the mitigation plan and produces an
+# agent-ready Next Steps spec a human responder (or a downstream agent) can
+# run against the cluster.
+#
+# Inputs come from the Trigger Lambda (devops-agent-trigger-upgrade), which:
+#   - Reads the EventBridge `Investigation Completed` event metadata to build
+#     `investigation_summary` (agent_space_id, task_id, execution_id, status,
+#     investigation_type='mitigation').
+#   - Calls aidevops:ListJournalRecords(agentSpaceId, executionId) on the
+#     DevOps Agent and stitches every record's `content` field into
+#     `investigation_findings` — the agent's mitigation plan, including the
+#     `## Mitigation Plan` section, recovery steps, verification commands,
+#     and risks/blockers.
+
+on:
+  # checkov:skip=CKV_GHA_7: workflow_dispatch inputs are required — the Trigger Lambda
+  # passes the investigation summary and mitigation plan that drive the code fix.
+  workflow_dispatch:
+    inputs:
+      investigation_summary:
+        description: JSON metadata blob from the Trigger Lambda (agent_space_id, task_id, execution_id, status, investigation_type='mitigation')
+        required: true
+        type: string
+      investigation_findings:
+        description: Stitched journal records from the agent's mitigation-plan investigation
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  next-steps-spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+
+      - name: Validate investigation_summary input
+        env:
+          INVESTIGATION_SUMMARY: ${{ inputs.investigation_summary }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          raw = os.environ.get('INVESTIGATION_SUMMARY', '')
+          try:
+              data = json.loads(raw)
+          except (json.JSONDecodeError, TypeError) as e:
+              print(f"ERROR: investigation_summary is not valid JSON: {e}", file=sys.stderr)
+              sys.exit(1)
+          required = ['agent_space_id', 'task_id', 'status']
+          missing = [k for k in required if k not in data]
+          if missing:
+              print(f"ERROR: investigation_summary missing required fields: {missing}", file=sys.stderr)
+              sys.exit(1)
+          itype = data.get('investigation_type', 'unknown')
+          if itype != 'mitigation':
+              print(f"ERROR: this workflow only runs for mitigation-plan investigations (got investigation_type={itype})", file=sys.stderr)
+              sys.exit(1)
+          print(f"Validated: task_id={data['task_id']} type={itype} status={data['status']}")
+          PY
+
+      - name: Write investigation findings to file
+        env:
+          INVESTIGATION_FINDINGS: ${{ inputs.investigation_findings }}
+        run: |
+          printf '%s\n' "$INVESTIGATION_FINDINGS" > /tmp/investigation-findings.md
+          echo "Wrote $(wc -c < /tmp/investigation-findings.md) bytes to /tmp/investigation-findings.md"
+
+      - name: Extract and validate mitigation spec
+        env:
+          INVESTIGATION_SUMMARY: ${{ inputs.investigation_summary }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+
+          findings_path = pathlib.Path('/tmp/investigation-findings.md')
+          if not findings_path.exists() or findings_path.stat().st_size == 0:
+              print("::error::Mitigation pipeline STOPPED — investigation findings file is empty or missing.")
+              sys.exit(1)
+
+          raw = findings_path.read_text()
+
+          # Normalize literal \n / \t from JSON-escaped agent content.
+          findings = raw.replace('\\n', '\n').replace('\\t', '\t')
+
+          # --- Look for the agent-ready spec ---
+          # The Trigger Lambda extracts this via _extract_mitigation_spec() which
+          # produces a structured "# Agent-ready spec" with "## Change requirements".
+          # If that extraction failed, we may have the raw findings with
+          # "## Mitigation Plan" or "# Mitigation Summary" sections.
+          #
+          # Both headings must be matched at START OF LINE. Agents echo
+          # SKILL.md and other instruction-file content that *describes* this
+          # contract in prose ("emit a `## Mitigation Plan`, a
+          # `## Immediate Steps` block..."), and an unanchored match happily
+          # latched onto that backtick-quoted reference. Keep this anchoring
+          # in lockstep with _extract_actionable_content in
+          # devops-agent-space.yaml.
+
+          # Strategy: find the best actionable section in priority order.
+          spec = None
+          source = None
+
+          # Priority 1: Structured agent-ready spec (from write_mitigation_code_spec tool)
+          agent_spec_re = re.compile(
+              r'(^# Agent-ready spec[ \t]*\n.*?)(?=\n# [A-Z]|\Z)',
+              re.DOTALL | re.MULTILINE,
+          )
+          m = agent_spec_re.search(findings)
+          if m:
+              candidate = m.group(1).strip()
+              if '## Change requirements' in candidate or 'acceptance criteria' in candidate.lower():
+                  spec = candidate
+                  source = 'agent-ready spec (structured)'
+
+          # Priority 2: Mitigation Plan section
+          if not spec:
+              for heading in ['## Mitigation Plan', '# Mitigation Summary']:
+                  pattern = re.compile(
+                      r'^' + re.escape(heading) + r'[ \t]*\n(.*?)(?=\n# [A-Z]|\Z)',
+                      re.DOTALL | re.MULTILINE,
+                  )
+                  m = pattern.search(findings)
+                  if m:
+                      candidate = heading + '\n' + m.group(1).strip()
+                      # Must contain some actionable content
+                      if any(kw in candidate.lower() for kw in ['step', 'action', 'fix', 'change', 'update', 'modify']):
+                          spec = candidate
+                          source = f'section: {heading}'
+                          break
+
+          # --- Validate ---
+          summary_raw = os.environ.get('INVESTIGATION_SUMMARY', '{}')
+          try:
+              summary = json.loads(summary_raw)
+          except (json.JSONDecodeError, TypeError):
+              summary = {}
+          cluster = summary.get('cluster_name', 'unknown')
+          task_id = summary.get('task_id', 'unknown')
+
+          if not spec:
+              print("::error::Mitigation pipeline STOPPED — no actionable mitigation spec found in findings.")
+              print(
+                  f"ERROR: Could not extract a mitigation spec from investigation findings.\n\n"
+                  f"Cluster: {cluster}\n"
+                  f"Task ID: {task_id}\n\n"
+                  f"The findings did not contain an agent-ready spec (# Agent-ready spec with "
+                  f"## Change requirements) or a Mitigation Plan section with actionable steps.\n\n"
+                  f"Action required: inspect the investigation in the DevOps Agent console "
+                  f"and re-run this workflow manually once the issue is resolved.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          # Reject if it looks like raw skill template / placeholder text
+          PLACEHOLDER = re.compile(r'<[^>]{4,}>')  # angle-bracket placeholders
+          placeholder_matches = PLACEHOLDER.findall(spec)
+          # Filter out legitimate HTML-like tags
+          real_placeholders = [p for p in placeholder_matches
+                               if not p.startswith('<http') and not p.startswith('<a ')
+                               and not p.startswith('</')]
+          if len(real_placeholders) > 3:
+              print(f"::warning::Mitigation spec contains {len(real_placeholders)} placeholder-like markers — may be a template echo.")
+
+          # Write the clean spec for Kiro
+          spec_path = pathlib.Path('/tmp/mitigation-spec.md')
+          spec_path.write_text(spec + '\n')
+          print(f"Mitigation spec validated and extracted ({spec_path}, {len(spec)} bytes).")
+          print(f"  Source: {source}")
+          print(f"  Cluster: {cluster} | Task: {task_id}")
+          PY
+
+      - name: Install Kiro CLI
+        env:
+          KIRO_MIN_VERSION: "1.0.3"
+        run: |
+          curl -fsSL https://cli.kiro.dev/install -o /tmp/kiro-install.sh
+          chmod +x /tmp/kiro-install.sh
+          bash /tmp/kiro-install.sh
+          rm -f /tmp/kiro-install.sh
+          installed=$(kiro-cli --version | awk '{print $NF}')
+          if [ "$(printf '%s\n' "$KIRO_MIN_VERSION" "$installed" | sort -V | head -n1)" != "$KIRO_MIN_VERSION" ]; then
+            echo "ERROR: Kiro CLI ${installed} is older than minimum ${KIRO_MIN_VERSION}"
+            exit 1
+          fi
+          if [ "$installed" != "$KIRO_MIN_VERSION" ]; then
+            echo "::warning::Kiro CLI ${installed} is newer than tested ${KIRO_MIN_VERSION} — verify compatibility and update KIRO_MIN_VERSION"
+          fi
+
+      - name: Run Kiro CLI to implement mitigation spec
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+        run: |
+          kiro-cli chat --no-interactive --trust-tools=read,write,glob,grep \
+            "Read the file /tmp/mitigation-spec.md — it contains a validated agent-ready spec with change requirements and acceptance criteria from a DevOps Agent mitigation plan for a failed EKS upgrade. Implement those changes in the CDK code. Instructions: 1. Read /tmp/mitigation-spec.md for the spec 2. Read lib/iteration3-stack.ts and package.json for current code 3. Apply the changes described in the spec's change requirements 4. Only modify files needed to satisfy the acceptance criteria 5. Make only the file edits — do NOT run any build or shell commands 6. Do NOT modify devops-agent-space.yaml, .github/workflows/, skills/, or kiro-cdk-instructions.md"
+
+      - name: Enforce file-change allowlist
+        run: |
+          ALLOWED='^(lib/iteration3-stack\.ts|package\.json|package-lock\.json)$'
+          changed=$(git diff --name-only)
+          bad=$(echo "$changed" | grep -vE "$ALLOWED" || true)
+          if [ -n "$bad" ]; then
+            echo "ERROR: Kiro modified files outside the allowlist:"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Validate CDK changes
+        run: |
+          npm install
+          npm run build
+          npx cdk synth --quiet
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          branch: fix/mitigation-${{ github.run_id }}
+          title: "fix(eks): Failure mitigation for ${{ fromJSON(inputs.investigation_summary).cluster_name || 'eks-cluster' }} (#${{ github.run_number }})"
+          labels: |
+            eks-mitigation
+            automated
+          body: |
+            Automated code fix PR generated by Kiro CLI from a DevOps Agent
+            mitigation-plan investigation.
+
+            The pipeline that produced this PR:
+            1. AWS CloudFormation rollback detected → Failure Lambda opened investigation
+            2. Agent identified root cause → Trigger Lambda triggered mitigation
+            3. Mitigation Agent produced agent-ready spec with change requirements
+            4. Kiro CLI implemented the spec in CDK code
+
+            ### Reviewer checklist
+            - [ ] Changes satisfy the acceptance criteria in the agent-ready spec
+            - [ ] `npm run build` passes
+            - [ ] `npx cdk diff` shows only Modify operations (never Replace)
+            - [ ] No unrelated changes
+
+            ### Investigation context
+
+            <!-- investigation-context-start -->
+            ```json
+            ${{ inputs.investigation_summary }}
+            ```
+            <!-- investigation-context-end -->

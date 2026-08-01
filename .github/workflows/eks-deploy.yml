@@ -1,0 +1,83 @@
+name: EKS Deploy (post-merge)
+
+# Manual trigger after the upgrade PR has been merged to main. Deploys the CDK
+# changes to the real cluster.
+
+on:
+  # checkov:skip=CKV_GHA_7: workflow_dispatch inputs are required — this workflow is
+  # manually triggered with the merged PR number to locate the CDK changes to deploy.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the merged EKS upgrade PR (e.g. 42)
+        required: true
+        type: string
+
+permissions:
+  id-token: write       # for OIDC → AWS role assumption
+  contents: read        # for actions/checkout
+  pull-requests: read   # for reading the PR body
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK dependencies
+        run: npm ci
+
+      - name: Fetch PR body and extract investigation task_id
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          gh pr view "$PR_NUMBER" --json body --jq .body > /tmp/pr-body.md
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+          body = pathlib.Path('/tmp/pr-body.md').read_text()
+          m = re.search(
+              r'<!-- investigation-context-start -->.*?```json\s*(\{.*?\})\s*```\s*<!-- investigation-context-end -->',
+              body, re.DOTALL,
+          )
+          if not m:
+              print("ERROR: PR body is missing the investigation-context block.", file=sys.stderr)
+              print("This PR wasn't opened by the upgrade workflow, or the block was removed.", file=sys.stderr)
+              sys.exit(1)
+          raw = m.group(1).strip()
+          try:
+              summary = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              print(f"ERROR: correlation block is not valid JSON: {exc}", file=sys.stderr)
+              sys.exit(1)
+          task_id = summary.get('task_id')
+          if not task_id:
+              print("ERROR: correlation block has no task_id.", file=sys.stderr)
+              sys.exit(1)
+          print(f"Using investigation task_id={task_id} for CFN stack tag")
+          out = pathlib.Path(os.environ['GITHUB_OUTPUT'])
+          with out.open('a') as f:
+              f.write(f"task_id={task_id}\n")
+          PY
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: cdk deploy
+        # Pass the investigation task_id as CDK context. The stack reads it and
+        # applies it as a tag (InvestigationTaskId=<task_id>) so the AWS-side
+        # failure detector can correlate any upgrade failure back to the
+        # original investigation.
+        run: npx cdk deploy --require-approval never -c investigationTaskId=${{ steps.context.outputs.task_id }}

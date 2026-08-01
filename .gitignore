@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+
+# Build output
+*.js
+!jest.config.js
+*.d.ts
+*.tsbuildinfo
+
+# CDK
+cdk.out/
+cdk.context.json
+cdk.context.json.bak
+.cdk.staging/
+
+# cdk-nag generated scan report (regenerate with `npx cdk synth`)
+cdk-nag-report.txt
+
+# Python (Lambda sources + inline handler tests)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Lambda layer build artifacts
+lambda-layers/devops-agent-sdk/layer.zip
+lambda-layers/devops-agent-sdk/botocore-models/
+
+# Env / credentials
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test coverage
+coverage/
+*.lcov
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+validate.py
+
+# Agent project config (local, not published)
+AGENTS.md
+CLAUDE.md

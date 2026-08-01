@@ -1,0 +1,328 @@
+name: Skill Update
+
+run-name: "Skill Update: #${{ github.run_number }}"
+
+# Triggered by the Trigger Lambda via workflow_dispatch when an
+# eks-skill-review investigation completes and produces a Skill Update
+# Spec with CHANGES_FOUND: YES.
+#
+# Inputs come from the Trigger Lambda, which:
+#   - Detects the "### Skill Update Spec" marker in journal records
+#   - Extracts the spec content and passes it as investigation_findings
+
+on:
+  # checkov:skip=CKV_GHA_7: workflow_dispatch inputs are required — the Trigger Lambda
+  # passes the investigation summary and Skill Update Spec that drive the skill change.
+  workflow_dispatch:
+    inputs:
+      investigation_summary:
+        description: JSON metadata blob from the Trigger Lambda (agent_space_id, task_id, execution_id, status, investigation_type)
+        required: true
+        type: string
+      investigation_findings:
+        description: Skill Update Spec from the agent's review investigation
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  skill-update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate investigation_summary input
+        env:
+          INVESTIGATION_SUMMARY: ${{ inputs.investigation_summary }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          raw = os.environ.get('INVESTIGATION_SUMMARY', '')
+          try:
+              data = json.loads(raw)
+          except (json.JSONDecodeError, TypeError) as e:
+              print(f"ERROR: investigation_summary is not valid JSON: {e}", file=sys.stderr)
+              sys.exit(1)
+          required = ['agent_space_id', 'task_id', 'status']
+          missing = [k for k in required if k not in data]
+          if missing:
+              print(f"ERROR: investigation_summary missing required fields: {missing}", file=sys.stderr)
+              sys.exit(1)
+          print(f"Validated: task_id={data['task_id']} status={data['status']} type={data.get('investigation_type')}")
+          PY
+
+      - name: Write investigation findings to file
+        env:
+          INVESTIGATION_FINDINGS: ${{ inputs.investigation_findings }}
+        run: |
+          printf '%s\n' "$INVESTIGATION_FINDINGS" > /tmp/investigation-findings.md
+          echo "Wrote $(wc -c < /tmp/investigation-findings.md) bytes to /tmp/investigation-findings.md"
+
+      - name: Extract and validate Skill Update Spec
+        env:
+          INVESTIGATION_SUMMARY: ${{ inputs.investigation_summary }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+
+          findings_path = pathlib.Path('/tmp/investigation-findings.md')
+          if not findings_path.exists() or findings_path.stat().st_size == 0:
+              print("::error::Skill update pipeline STOPPED — investigation findings file is empty or missing.")
+              sys.exit(1)
+
+          raw = findings_path.read_text()
+
+          # Normalize literal \n / \t from JSON-escaped agent content.
+          findings = raw.replace('\\n', '\n').replace('\\t', '\t')
+
+          # --- Extract the Skill Update Spec block ---
+          # The agent emits this inside a fenced code block after "### Skill Update Spec"
+          # or as a standalone section. The key fields are:
+          #   CHANGES_FOUND: YES
+          #   SKILL: <name>
+          #   SUGGESTED_EDIT: |
+          #     <content>
+          #
+          # The findings are the raw stitched journal records, which contain
+          # confounders we must NOT mistake for the agent's answer:
+          #   1. The eks-skill-review SKILL.md is echoed back into the record,
+          #      including its Step 6 TEMPLATE ("SKILL: <skill-name>",
+          #      "CHANGES_FOUND: YES" and "CHANGES_FOUND: NO" examples).
+          #   2. Embedded file listings carry a line-number gutter ("   77\t"),
+          #      so "CHANGES_FOUND: YES" arrives as "77<TAB>CHANGES_FOUND: YES",
+          #      which ^\s* anchoring alone cannot match past the digits+tab.
+          # The gutters are therefore stripped first, then ALL candidate blocks
+          # are gathered, the template echo is discarded, and the LAST real spec
+          # (the agent's final answer) is kept.
+
+          def strip_gutter(text):
+              # Drop a leading line-number gutter like "   77\t" or "77\t".
+              return '\n'.join(re.sub(r'^\s*\d+\t', '', ln) for ln in text.split('\n'))
+
+          # Keep in sync with _is_skill_template_echo in the Trigger Lambda
+          # (devops-agent-space.yaml) — the two are halves of one contract.
+          PLACEHOLDER = r'<[a-z][a-z0-9 _/-]*>'
+
+          def is_template_echo(block):
+              # The SKILL.md template uses <angle-bracket> placeholders and shows
+              # BOTH the YES and NO examples; a real spec has neither trait.
+              #
+              # The YES/NO pair test alone is not enough: the template's two
+              # examples are SEPARATE fenced blocks each under their own
+              # "### Skill Update Spec" heading, so Strategy 2 matches the NO
+              # example ALONE — one block, no YES, no SKILL: line. Also reject a
+              # block whose recognised field VALUES still hold placeholders.
+              # SUGGESTED_EDIT bodies are exempt (real edits contain angle
+              # brackets, e.g. `<previous-version>` in a rollback command).
+              if re.search(r'^\s*SKILL:\s*<', block, re.M):
+                  return True
+              placeholder_field = (
+                  r'^\s*(?:SKILL|SECTION|CHANGE_TYPE|DESCRIPTION|REVIEW_SUMMARY)'
+                  r':[^\n]*' + PLACEHOLDER
+              )
+              if re.search(placeholder_field, block, re.M | re.I):
+                  return True
+              has_yes = re.search(r'CHANGES_FOUND:\s*YES', block, re.I)
+              has_no = re.search(r'CHANGES_FOUND:\s*NO', block, re.I)
+              return bool(has_yes and has_no)
+
+          candidates = []  # (source, block)
+
+          # Strategy 1: fenced blocks containing the spec fields
+          fence_re = re.compile(r'```[a-zA-Z]*\n(.*?)```', re.DOTALL)
+          for m in fence_re.finditer(findings):
+              block = strip_gutter(m.group(1)).strip()
+              if 'CHANGES_FOUND' in block and 'SKILL:' in block:
+                  candidates.append(('fenced code block', block))
+
+          # Strategy 2: every "### Skill Update Spec" section (unfenced)
+          section_re = re.compile(
+              r'###\s+Skill Update Spec\s*\n(.*?)(?=\n###\s+|\n## |\Z)',
+              re.DOTALL,
+          )
+          for m in section_re.finditer(findings):
+              block = strip_gutter(m.group(1)).strip()
+              if 'CHANGES_FOUND' in block:
+                  candidates.append(('### Skill Update Spec section', block))
+
+          # Strategy 3: the findings may ALREADY be an extracted bare spec.
+          # The Trigger Lambda's dispatcher runs _extract_skill_update_spec()
+          # BEFORE it dispatches this workflow — it isolates the agent's real
+          # spec and, in doing so, strips both the "### Skill Update Spec"
+          # header and the surrounding ``` fence. The clean payload then arrives
+          # here as bare "SKILL: ...\nCHANGES_FOUND: ..." with no marker for
+          # Strategy 1 or 2 to latch onto, so both find zero candidates. Treat
+          # the whole body as a candidate when it carries the spec fields at the
+          # top level. The is_template_echo() filter below still rejects it if
+          # the dispatcher fell back to sending raw findings (which contain the
+          # SKILL.md template's <placeholders> and both YES/NO examples), so this
+          # only wins for a genuinely pre-extracted spec.
+          whole = strip_gutter(findings).strip()
+          if re.search(r'^\s*CHANGES_FOUND:', whole, re.M) and re.search(r'^\s*SKILL:', whole, re.M):
+              candidates.append(('pre-extracted bare spec', whole))
+
+          # Discard template echoes; prefer the last real spec (agent's final answer).
+          real = [(src, blk) for src, blk in candidates if not is_template_echo(blk)]
+          spec = None
+          source = None
+          if real:
+              source, spec = real[-1]
+          elif candidates:
+              # Only template echoes were found — treat as "no real spec".
+              print("::warning::Only Skill Update Spec template echoes found (no agent spec).")
+
+          # --- Validate ---
+          summary_raw = os.environ.get('INVESTIGATION_SUMMARY', '{}')
+          try:
+              summary = json.loads(summary_raw)
+          except (json.JSONDecodeError, TypeError):
+              summary = {}
+          task_id = summary.get('task_id', 'unknown')
+
+          if not spec:
+              print("::error::Skill update pipeline STOPPED — no Skill Update Spec found in findings.")
+              print(
+                  f"ERROR: Could not extract a Skill Update Spec from investigation findings.\n\n"
+                  f"Task ID: {task_id}\n\n"
+                  f"The findings did not contain a block with CHANGES_FOUND and SKILL fields.\n\n"
+                  f"Action required: inspect the investigation in the DevOps Agent console "
+                  f"and re-run this workflow manually once the issue is resolved.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          # Check CHANGES_FOUND value.
+          # Tolerate leading indentation: the detection step above uses an
+          # unanchored substring test ('CHANGES_FOUND' in block), so a block is
+          # selected whenever the field appears anywhere — including indented
+          # inside a fenced block or a SUGGESTED_EDIT block-scalar. Anchoring the
+          # validation to column 0 (^) here would then fail to match a field the
+          # agent clearly emitted, stopping the pipeline with a misleading
+          # "CHANGES_FOUND field missing" error. Allow optional leading whitespace.
+          changes_match = re.search(r'^\s*CHANGES_FOUND:\s*(\w+)', spec, re.M)
+          if not changes_match:
+              print("::error::Skill update pipeline STOPPED — CHANGES_FOUND field missing from spec.")
+              sys.exit(1)
+
+          if changes_match.group(1).strip().upper() != 'YES':
+              print(f"Skill review completed with CHANGES_FOUND: {changes_match.group(1)} — no updates needed.")
+              print("Pipeline will exit cleanly (no PR to create).")
+              # Write a marker file so downstream steps can skip
+              pathlib.Path('/tmp/skill-update-noop').write_text('true')
+              pathlib.Path('/tmp/skill-update-spec.txt').write_text(spec + '\n')
+              sys.exit(0)
+
+          # Validate that at least one SKILL + SUGGESTED_EDIT pair exists
+          skill_count = len(re.findall(r'^\s*SKILL:', spec, re.M))
+          edit_count = len(re.findall(r'^\s*SUGGESTED_EDIT:', spec, re.M))
+          if skill_count == 0 or edit_count == 0:
+              print("::error::Skill update pipeline STOPPED — CHANGES_FOUND=YES but no SKILL/SUGGESTED_EDIT pairs found.")
+              print(
+                  f"ERROR: Spec has CHANGES_FOUND=YES but contains {skill_count} SKILL "
+                  f"and {edit_count} SUGGESTED_EDIT entries.\n\n"
+                  f"Task ID: {task_id}\n\n"
+                  f"Action required: inspect the investigation output.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          # Write the clean spec for Kiro
+          spec_path = pathlib.Path('/tmp/skill-update-spec.txt')
+          spec_path.write_text(spec + '\n')
+          print(f"Skill Update Spec validated and extracted ({spec_path}, {len(spec)} bytes).")
+          print(f"  Source: {source}")
+          print(f"  Task: {task_id}")
+          print(f"  Changes: {skill_count} skill(s), {edit_count} edit(s)")
+          PY
+
+      - name: Check if updates are needed
+        id: check-noop
+        run: |
+          if [ -f /tmp/skill-update-noop ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No skill changes needed — skipping Kiro and PR steps."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Kiro CLI
+        if: steps.check-noop.outputs.skip != 'true'
+        env:
+          KIRO_MIN_VERSION: "1.0.3"
+        run: |
+          curl -fsSL https://cli.kiro.dev/install -o /tmp/kiro-install.sh
+          chmod +x /tmp/kiro-install.sh
+          bash /tmp/kiro-install.sh
+          rm -f /tmp/kiro-install.sh
+          installed=$(kiro-cli --version | awk '{print $NF}')
+          if [ "$(printf '%s\n' "$KIRO_MIN_VERSION" "$installed" | sort -V | head -n1)" != "$KIRO_MIN_VERSION" ]; then
+            echo "ERROR: Kiro CLI ${installed} is older than minimum ${KIRO_MIN_VERSION}"
+            exit 1
+          fi
+          if [ "$installed" != "$KIRO_MIN_VERSION" ]; then
+            echo "::warning::Kiro CLI ${installed} is newer than tested ${KIRO_MIN_VERSION} — verify compatibility and update KIRO_MIN_VERSION"
+          fi
+
+      - name: Run Kiro CLI to apply skill updates
+        if: steps.check-noop.outputs.skip != 'true'
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+        run: |
+          kiro-cli chat --no-interactive --trust-tools=read,write,glob,grep \
+            "Read the file /tmp/skill-update-spec.txt — it contains a validated Skill Update Spec from an automated skill review. Apply the suggested edits to the SKILL.md files under skills/. For each change in the spec, locate the SKILL and SECTION mentioned and apply the SUGGESTED_EDIT. Only modify lines explicitly called out. Do not reformat or restructure unchanged sections. Stop at file changes — do not commit."
+
+      - name: Rebuild skill zip files
+        if: steps.check-noop.outputs.skip != 'true'
+        run: |
+          cd skills
+          for dir in */; do zip -r "${dir%/}.zip" "$dir"; done
+
+      - name: Create pull request
+        if: steps.check-noop.outputs.skip != 'true'
+        id: cpr
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          branch: skill-update/automated-${{ github.run_id }}
+          title: "docs(skills): Update EKS pipeline skills (#${{ github.run_number }})"
+          labels: |
+            skill-update
+            automated
+          body: |
+            Automated skill update PR generated by the daily eks-skill-review investigation.
+
+            ## Changes Detected
+
+            The DevOps Agent reviewed current AWS EKS APIs and documentation against
+            our pipeline skills and found updates needed.
+
+            <details>
+            <summary>Skill Update Spec (raw)</summary>
+
+            ```
+            ${{ inputs.investigation_findings }}
+            ```
+            </details>
+
+            ## Next Steps
+
+            The skill zips were already rebuilt by this workflow and are
+            included in the diff — no manual rebuild is needed.
+
+            - [ ] Review suggested changes for accuracy
+            - [ ] Approve and merge this PR
+            - [ ] Re-upload the changed zips to the DevOps Agent space (Console → Settings → Skills → replace existing)
+
+            ### Machine-readable correlation (do not remove)
+
+            <!-- investigation-context-start -->
+            ```json
+            ${{ inputs.investigation_summary }}
+            ```
+            <!-- investigation-context-end -->
