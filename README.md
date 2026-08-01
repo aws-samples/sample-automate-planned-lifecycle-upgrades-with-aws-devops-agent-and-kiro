@@ -1,4 +1,4 @@
-# Amazon EKS Automated Upgrade Pipeline
+# Automate Planned Lifecycle Upgrades with AWS DevOps Agent and Kiro
 
 > **Sample code.** This repository is a proof of concept provided for demonstration and educational purposes. It is not a finished product and must not be deployed as-is — review, security-assess, test, and harden it against your own requirements first. See [DISCLAIMER.txt](DISCLAIMER.txt) for the full text and [Known limitations](#known-limitations) for specific gaps.
 
