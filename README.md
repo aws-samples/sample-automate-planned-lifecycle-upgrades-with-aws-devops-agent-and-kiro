@@ -891,3 +891,11 @@ This is sample/POC code. Teams adopting it for production should confirm these c
 ## Conclusion
 
 This pipeline automates Amazon EKS upgrade planning with human review gates — AWS Health triggers the investigation, the AWS DevOps Agent plans the upgrade, and Kiro CLI opens a pull request. The closed-loop failure path ensures that real deployment failures also get automated root-cause analysis and code fix PRs. A daily skill review keeps the pipeline's agent skills current with AWS EKS changes, opening PRs and notifying via SNS when updates are needed. Customize the skills in `skills/` and extend the EventBridge rules to cover additional cluster operations as needed.
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
