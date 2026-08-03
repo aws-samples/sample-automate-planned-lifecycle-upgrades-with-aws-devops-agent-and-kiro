@@ -1,8 +1,8 @@
-# Automate Planned Lifecycle Upgrades with AWS DevOps Agent and Kiro
+# Amazon EKS Automated Upgrade Pipeline
 
 > **Sample code.** This repository is a proof of concept provided for demonstration and educational purposes. It is not a finished product and must not be deployed as-is — review, security-assess, test, and harden it against your own requirements first. See [DISCLAIMER.txt](DISCLAIMER.txt) for the full text and [Known limitations](#known-limitations) for specific gaps.
 
-Automated Amazon EKS upgrade pipeline: AWS CDK provisions an Amazon EKS cluster → AWS DevOps Agent investigates upgrade feasibility → AWS Lambda bridges results to GitHub Actions via Amazon EventBridge → Kiro CLI headless mode applies CDK changes → PR created for human review.
+Automated Amazon EKS upgrade pipeline: AWS Cloud Development Kit (AWS CDK) provisions an Amazon EKS cluster → AWS DevOps Agent investigates upgrade feasibility → AWS Lambda bridges results to GitHub Actions via Amazon EventBridge → Kiro CLI headless mode applies CDK changes → PR created for human review.
 
 AWS Health detects that a cluster is approaching end-of-support, the AWS DevOps Agent plans the upgrade using a structured skill, and Kiro CLI opens a pull request with the CDK changes. A human reviews and merges. A daily automated review keeps skills aligned with the latest AWS EKS capabilities.
 
@@ -81,7 +81,7 @@ Follow these steps to deploy the complete Amazon EKS automated upgrade pipeline 
 - A GitHub repo you control — fork this one, or clone it and push to your own remote. The pipeline dispatches workflows against *your* copy, so it can't be the upstream repo.
 - GitHub PAT with `repo` and `actions` scopes
 - Kiro CLI API key (for GitHub Actions)
-- AWS CLI configured with a profile that has admin access
+- AWS Command Line Interface (AWS CLI) configured with a profile that has admin access
 
 ### Step 1: Clone your fork
 
@@ -105,7 +105,7 @@ This runs steps that used to be manual:
 1. `npm install`
 2. `cdk bootstrap` (only if the target account/region isn't already bootstrapped)
 3. `cdk deploy` — VPC, EKS cluster (v1.30), node group, 3 managed addons (vpc-cni, kube-proxy, coredns), and the AWS Load Balancer Controller Helm chart (~20 min)
-4. Builds and uploads the `devops-agent-sdk` Lambda layer (botocore service model JSON for the `devops-agent` API — see `lambda-layers/devops-agent-sdk/README.md`), then `aws cloudformation deploy` — DevOps Agent space, IAM roles, EventBridge rules, three Lambda functions (Health, Trigger, Failure), the Lambda layer, and Secrets Manager secrets. The CFN template is over CloudFormation's 51,200-byte inline limit (mostly because the three Lambdas ship inline), so `bootstrap.sh` passes `--s3-bucket` to `aws cloudformation deploy` and the CLI auto-uploads the template to the CDK assets bucket under `cloudformation-templates/` before invoking the API. No new bucket is provisioned
+4. Builds and uploads the `devops-agent-sdk` Lambda layer (botocore service model JSON for the `devops-agent` API — see `lambda-layers/devops-agent-sdk/README.md`), then `aws cloudformation deploy` — DevOps Agent space, AWS Identity and Access Management (IAM) roles, EventBridge rules, three Lambda functions (Health, Trigger, Failure), the Lambda layer, and Secrets Manager secrets. The CFN template is over CloudFormation's 51,200-byte inline limit (mostly because the three Lambdas ship inline), so `bootstrap.sh` passes `--s3-bucket` to `aws cloudformation deploy` and the CLI auto-uploads the template to the CDK assets bucket under `cloudformation-templates/` before invoking the API. No new bucket is provisioned
 
 Optional env vars: `AWS_PROFILE`, `AWS_REGION`, `STACK_NAME` (defaults to `DevOpsAgentStack`), `NAME_SUFFIX` (see below), `GITHUB_REPO` (passed to CFN as `GitHubRepo`), `SKIP_CDK=1`, `SKIP_CFN=1`.
 
