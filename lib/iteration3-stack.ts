@@ -52,21 +52,28 @@ export class EksUpgradePocStack extends cdk.Stack {
       ],
     });
 
-    cluster.addNodegroupCapacity('Nodes', {
+    const nodegroup = cluster.addNodegroupCapacity('Nodes', {
       nodegroupName: `poc-nodes${suffix}`,
       instanceTypes: [new ec2.InstanceType('t3.medium')],
       minSize: 2,
       maxSize: 3,
       desiredSize: 2,
-      amiType: eks.NodegroupAmiType.AL2_X86_64,
+      amiType: eks.NodegroupAmiType.AL2023_X86_64_STANDARD,
     });
 
-    new eks.CfnAddon(this, 'VpcCni', {
+    const vpcCni = new eks.CfnAddon(this, 'VpcCni', {
       clusterName: cluster.clusterName,
       addonName: 'vpc-cni',
       addonVersion: 'v1.21.1-eksbuild.7',
       resolveConflicts: 'OVERWRITE',
     });
+
+    // New node AMIs expect the updated vpc-cni, so the add-on update must
+    // complete before the node group rolling update begins. Without this,
+    // CloudFormation is free to update the node group first and pods on the
+    // new nodes lose networking. Scoped to vpc-cni deliberately: kube-proxy
+    // and coredns ordering is operational sequence, not a hard constraint.
+    nodegroup.node.addDependency(vpcCni);
 
     new eks.CfnAddon(this, 'KubeProxy', {
       clusterName: cluster.clusterName,

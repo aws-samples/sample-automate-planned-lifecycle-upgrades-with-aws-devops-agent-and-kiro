@@ -80,7 +80,7 @@ git commit -m "feat(eks): Upgrade cluster from 1.29 to 1.30
 - coredns: <old> → <new>
 - kubectlLayer: v29 → v30
 
-Upgrade sequence (enforced by CloudFormation):
+Upgrade sequence (vpc-cni before node groups is enforced via a CloudFormation DependsOn; the remaining order is required operational sequence, not a synthesized dependency):
 1. Control plane (rollback available for 7 days)
 2. vpc-cni addon (MUST be before node groups)
 3. kube-proxy addon
