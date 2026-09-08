@@ -1,5 +1,7 @@
 # Automate Planned Lifecycle Upgrades with AWS DevOps Agent and Kiro
 
+You can find the related blogpost to this repository here: [Automate planned lifecycle upgrades with AWS DevOps Agent and Kiro](https://aws.amazon.com/blogs/devops/automate-planned-lifecycle-upgrades-with-aws-devops-agent-and-kiro/)
+
 > **Sample code.** This repository is a proof of concept provided for demonstration and educational purposes. It is not a finished product and must not be deployed as-is — review, security-assess, test, and harden it against your own requirements first. See [DISCLAIMER.txt](DISCLAIMER.txt) for the full text and [Known limitations](#known-limitations) for specific gaps.
 
 Automated Amazon EKS upgrade pipeline: AWS Cloud Development Kit (AWS CDK) provisions an Amazon EKS cluster → AWS DevOps Agent investigates upgrade feasibility → AWS Lambda bridges results to GitHub Actions via Amazon EventBridge → Kiro CLI headless mode applies CDK changes → PR created for human review.
